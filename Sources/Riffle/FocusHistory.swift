@@ -10,6 +10,11 @@ import ApplicationServices
 final class FocusHistory {
     static let shared = FocusHistory()
 
+    /// Guards `lastFocused` alone. It's written from the main thread (focus
+    /// notifications, and every switch we make) but pruned from the background
+    /// window sweep, so the two can collide. The rest of this class is
+    /// main-thread only.
+    private let lock = NSLock()
     private var lastFocused: [CGWindowID: Date] = [:]
     private var started = false
     private var observer: AXObserver?
@@ -32,15 +37,24 @@ final class FocusHistory {
     }
 
     func record(_ windowID: CGWindowID) {
+        lock.lock()
+        defer { lock.unlock() }
         lastFocused[windowID] = Date()
     }
 
-    func timestamp(for windowID: CGWindowID) -> Date? {
-        lastFocused[windowID]
+    /// A copy of the whole table. Callers that rank a window list want one
+    /// consistent view for the duration of a sort, not a lookup per comparison
+    /// that could see the table change halfway through.
+    func timestamps() -> [CGWindowID: Date] {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastFocused
     }
 
     /// Drop entries for windows that no longer exist.
     func prune(keeping alive: Set<CGWindowID>) {
+        lock.lock()
+        defer { lock.unlock() }
         lastFocused = lastFocused.filter { alive.contains($0.key) }
     }
 
@@ -66,6 +80,12 @@ final class FocusHistory {
     /// Move the focused-window observer to the now-frontmost app.
     private func watch(_ app: NSRunningApplication) {
         if let observer {
+            // Unregister before dropping the observer, so the old app's AX
+            // server stops tracking notifications nobody is listening for.
+            if let observedApp {
+                AXObserverRemoveNotification(observer, observedApp, kAXFocusedWindowChangedNotification as CFString)
+                AXObserverRemoveNotification(observer, observedApp, kAXMainWindowChangedNotification as CFString)
+            }
             CFRunLoopRemoveSource(
                 CFRunLoopGetMain(),
                 AXObserverGetRunLoopSource(observer),

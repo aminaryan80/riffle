@@ -39,23 +39,38 @@ enum WindowEnumerator {
     private static let cacheLock = NSLock()
     private static var cachedWindows: [RankedWindow]?
     private static var refreshInFlight = false
+    private static var refreshStale = false
     private static let refreshQueue = DispatchQueue(label: "Riffle.WindowEnumerator.refresh")
 
-    /// Rebuild the cached window list off the main thread. Coalesced: a request
-    /// that arrives while a refresh is running is dropped, since that in-flight
-    /// sweep will already produce an up-to-date list.
+    /// Rebuild the cached window list off the main thread. Coalesced: requests
+    /// that arrive while a refresh is running collapse into a single re-run
+    /// once it finishes.
     static func refreshAsync() {
         cacheLock.lock()
-        if refreshInFlight { cacheLock.unlock(); return }
+        if refreshInFlight {
+            // Don't just drop it. The in-flight sweep may have started *before*
+            // whatever prompted this request (an app quitting, say), so its
+            // result is already stale — it would bake the dead app back into the
+            // cache and leave it there until something else happened.
+            refreshStale = true
+            cacheLock.unlock()
+            return
+        }
         refreshInFlight = true
         cacheLock.unlock()
+        runRefresh()
+    }
 
+    private static func runRefresh() {
         refreshQueue.async {
             let ranked = enumerateWindows()
             cacheLock.lock()
             cachedWindows = ranked
-            refreshInFlight = false
+            let again = refreshStale
+            refreshStale = false
+            if !again { refreshInFlight = false }
             cacheLock.unlock()
+            if again { runRefresh() }
         }
     }
 
@@ -67,7 +82,7 @@ enum WindowEnumerator {
         let cached = cachedWindows
         cacheLock.unlock()
 
-        let ranked: [RankedWindow]
+        var ranked: [RankedWindow]
         if let cached {
             ranked = cached
             refreshAsync()
@@ -78,14 +93,24 @@ enum WindowEnumerator {
             cacheLock.unlock()
         }
 
+        // The cache is always a beat behind: the background refresh that a quit
+        // or a closed window kicks off can't finish before an immediate
+        // re-trigger, so the list would still show windows that are gone.
+        // Asking the window server which ids are still alive is a cheap call
+        // (unlike the AX sweep that builds the cache), so it can run per
+        // trigger and drop the dead ones before they're ever displayed.
+        let live = Set(cgWindows([.optionAll, .excludeDesktopElements]).map { $0.wid })
+        ranked = ranked.filter { live.contains($0.info.windowID) }
+
         let activeDisplay = currentActiveDisplay()
         let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
 
         // Most-recently-used first, from our own focus history; windows not
         // focused since launch fall back to front-to-back stacking order.
+        let focus = FocusHistory.shared.timestamps()
         let sorted = ranked.sorted { a, b in
-            let ta = FocusHistory.shared.timestamp(for: a.info.windowID)
-            let tb = FocusHistory.shared.timestamp(for: b.info.windowID)
+            let ta = focus[a.info.windowID]
+            let tb = focus[b.info.windowID]
             switch (ta, tb) {
             case let (x?, y?): return x > y
             case (.some, .none): return true
@@ -219,7 +244,13 @@ enum WindowEnumerator {
         // The public window list only covers the current Space. Probe for
         // windows in other Spaces only if it didn't already resolve every id
         // the window server attributes to this app (the common case).
-        let covered = { !expected.isEmpty && seen.isSuperset(of: expected) }
+        // `expected` is what the window server attributes to this app, and it is
+        // the same source the early exit trusts — so an empty `expected` means
+        // the app genuinely has no windows, not that we know nothing about it.
+        // Requiring it to be non-empty (as this used to) meant a windowless app
+        // could never satisfy the exit and ate the full probe, plus its entire
+        // time budget, on every sweep — to find the nothing we already knew about.
+        let covered = { seen.isSuperset(of: expected) }
         if !covered() {
             let deadline = Date().addingTimeInterval(perAppBudget)
             for axId in 0..<bruteForceRange {

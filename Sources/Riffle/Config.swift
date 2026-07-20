@@ -39,8 +39,18 @@ final class Config {
 
     /// Raw bindings as stored on disk (what the Settings UI edits).
     private(set) var fileBindings: [KeyBinding] = []
+
     /// Excluded apps, stored as bundle identifiers (app names as fallback).
-    private(set) var excludedApps: [String] = []
+    ///
+    /// Guarded, unlike everything else here: the background window sweep reads
+    /// this while the Settings window can be editing it on the main thread.
+    var excludedApps: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _excludedApps
+    }
+    private var _excludedApps: [String] = []
+    private let lock = NSLock()
     /// Bindings resolved to key codes/flags, used by the event tap.
     private(set) var bindings: [ResolvedBinding] = []
 
@@ -69,18 +79,24 @@ final class Config {
            let data = try? Data(contentsOf: Config.fileURL),
            let file = try? JSONDecoder().decode(ConfigFile.self, from: data) {
             fileBindings = file.bindings
-            excludedApps = file.excludedApps ?? []
+            setExcludedApps(file.excludedApps ?? [])
             listScale = Config.clampScale(file.listScale ?? listScale)
             backgroundOpacity = Config.clampOpacity(file.backgroundOpacity ?? backgroundOpacity)
         } else {
             fileBindings = Config.defaultBindings
-            excludedApps = []
+            setExcludedApps([])
             // Write defaults only when no file exists; never clobber a
             // malformed file the user may want to fix by hand.
             if !exists { save() }
         }
         if fileBindings.isEmpty { fileBindings = Config.defaultBindings }
         rebuildResolved()
+    }
+
+    private func setExcludedApps(_ apps: [String]) {
+        lock.lock()
+        defer { lock.unlock() }
+        _excludedApps = apps
     }
 
     func save() {
@@ -138,15 +154,30 @@ final class Config {
         save()
     }
 
+    // Both of these drop the lock before calling `save()`: save reads
+    // `excludedApps` back through the getter, which takes the same
+    // (non-recursive) lock and would deadlock if it were still held.
+
     func addExcludedApp(_ identifier: String) {
-        guard !identifier.isEmpty, !excludedApps.contains(identifier) else { return }
-        excludedApps.append(identifier)
+        guard !identifier.isEmpty else { return }
+        lock.lock()
+        guard !_excludedApps.contains(identifier) else {
+            lock.unlock()
+            return
+        }
+        _excludedApps.append(identifier)
+        lock.unlock()
         save()
     }
 
     func removeExcludedApp(at index: Int) {
-        guard excludedApps.indices.contains(index) else { return }
-        excludedApps.remove(at: index)
+        lock.lock()
+        guard _excludedApps.indices.contains(index) else {
+            lock.unlock()
+            return
+        }
+        _excludedApps.remove(at: index)
+        lock.unlock()
         save()
     }
 

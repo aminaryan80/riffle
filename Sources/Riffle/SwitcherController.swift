@@ -10,6 +10,23 @@ final class SwitcherController {
     private var holdModifiers: CGEventFlags = []
     private let panel = SwitcherPanelController()
 
+    /// How long the shortcut must stay held before the panel appears.
+    private static let showDelay: TimeInterval = 0.16
+    private var pendingShow: DispatchWorkItem?
+    private var currentScreen: NSScreen?
+
+    init() {
+        panel.onHover = { [weak self] index in self?.hover(index) }
+    }
+
+    /// The cursor moved onto a row: make it the selection, so releasing the
+    /// modifiers commits to whatever is under the pointer.
+    private func hover(_ index: Int) {
+        guard isActive, windows.indices.contains(index), index != selectedIndex else { return }
+        selectedIndex = index
+        panel.select(index, scroll: false)
+    }
+
     /// A bound hotkey was pressed (possibly repeatedly while held).
     func handleTrigger(binding: ResolvedBinding, backwards: Bool) {
         if isActive && currentScope == binding.scope {
@@ -44,7 +61,26 @@ final class SwitcherController {
             selectedIndex = windows.count > 1 ? 1 : 0
         }
         isActive = true
-        panel.show(windows: windows, selected: selectedIndex, on: snap.activeScreen)
+        scheduleShow(on: snap.activeScreen)
+    }
+
+    /// Holds the panel back for `showDelay` so a quick tap-and-release just
+    /// flips to the next window, like the system switcher.
+    private func scheduleShow(on screen: NSScreen?) {
+        pendingShow?.cancel()
+        currentScreen = screen
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isActive else { return }
+            self.showNow()
+        }
+        pendingShow = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.showDelay, execute: work)
+    }
+
+    private func showNow() {
+        pendingShow?.cancel()
+        pendingShow = nil
+        panel.show(windows: windows, selected: selectedIndex, on: currentScreen)
     }
 
     /// True while every modifier of the active binding is still held.
@@ -72,12 +108,21 @@ final class SwitcherController {
     func step(backwards: Bool) {
         guard !windows.isEmpty else { return }
         selectedIndex = (selectedIndex + (backwards ? -1 : 1) + windows.count) % windows.count
-        panel.select(selectedIndex)
+        // A second step means the user is cycling rather than flicking, so the
+        // panel earns its place immediately instead of waiting out the delay.
+        if pendingShow != nil {
+            showNow()
+        } else {
+            panel.select(selectedIndex)
+        }
     }
 
     private func reset() {
+        pendingShow?.cancel()
+        pendingShow = nil
         isActive = false
         currentScope = nil
+        currentScreen = nil
         windows = []
         panel.hide()
     }
