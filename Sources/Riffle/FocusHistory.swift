@@ -7,6 +7,9 @@ import ApplicationServices
 ///  - every app activation (workspace notification) records that app's focused window
 ///  - an AX observer on the frontmost app records focus changes *within* it
 ///  - every switch made through Riffle records the target directly
+///
+/// App launch often activates before AX has a focused window; we retry briefly
+/// and fall back to the window server's topmost window for that pid.
 final class FocusHistory {
     static let shared = FocusHistory()
 
@@ -19,6 +22,11 @@ final class FocusHistory {
     private var started = false
     private var observer: AXObserver?
     private var observedApp: AXUIElement?
+    /// Generation bumped on each activation so in-flight retries for an older
+    /// frontmost app bail out instead of recording stale focus.
+    private var activationGeneration: UInt64 = 0
+
+    private static let retryDelays: [TimeInterval] = [0.05, 0.2, 0.5]
 
     /// Idempotent; call once accessibility access is available.
     func start() {
@@ -31,8 +39,7 @@ final class FocusHistory {
             object: nil
         )
         if let front = NSWorkspace.shared.frontmostApplication {
-            recordFocusedWindow(of: front)
-            watch(front)
+            trackActivation(of: front)
         }
     }
 
@@ -62,19 +69,57 @@ final class FocusHistory {
 
     @objc private func appActivated(_ note: Notification) {
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-        recordFocusedWindow(of: app)
-        watch(app)
+        trackActivation(of: app)
     }
 
-    private func recordFocusedWindow(of app: NSRunningApplication) {
-        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+    private func trackActivation(of app: NSRunningApplication) {
+        activationGeneration &+= 1
+        let generation = activationGeneration
+        let pid = app.processIdentifier
+        watch(app)
+        if recordFocusedWindow(of: app) { return }
+        scheduleRetries(pid: pid, generation: generation)
+    }
+
+    /// Returns true when a window id was recorded.
+    @discardableResult
+    private func recordFocusedWindow(of app: NSRunningApplication) -> Bool {
+        if let wid = axFocusedWindowID(of: app.processIdentifier) {
+            record(wid)
+            return true
+        }
+        // AX often lags a brand-new window; the window server already knows.
+        if let wid = WindowEnumerator.topWindowID(for: app.processIdentifier) {
+            record(wid)
+            return true
+        }
+        return false
+    }
+
+    private func scheduleRetries(pid: pid_t, generation: UInt64) {
+        for delay in Self.retryDelays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                guard generation == self.activationGeneration else { return }
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+                if let wid = self.axFocusedWindowID(of: pid) {
+                    self.record(wid)
+                    return
+                }
+                if let wid = WindowEnumerator.topWindowID(for: pid) {
+                    self.record(wid)
+                }
+            }
+        }
+    }
+
+    private func axFocusedWindowID(of pid: pid_t) -> CGWindowID? {
+        let axApp = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(axApp, 0.25)
         var ref: CFTypeRef?
         guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &ref) == .success,
-              let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return }
-        if let wid = PrivateAX.windowID(of: ref as! AXUIElement) {
-            record(wid)
-        }
+              let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+        return PrivateAX.windowID(of: ref as! AXUIElement)
     }
 
     /// Move the focused-window observer to the now-frontmost app.

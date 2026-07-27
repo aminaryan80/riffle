@@ -74,9 +74,44 @@ enum WindowEnumerator {
         }
     }
 
+    /// Drop every cached window owned by `pid` (app quit). Cheap and synchronous
+    /// so the next trigger never resurrects a dead app while a full sweep runs.
+    static func remove(pid: pid_t) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        guard let cached = cachedWindows else { return }
+        cachedWindows = cached.filter { $0.info.pid != pid }
+    }
+
+    /// Drop specific window ids (closed windows).
+    static func remove(windowIDs: Set<CGWindowID>) {
+        guard !windowIDs.isEmpty else { return }
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        guard let cached = cachedWindows else { return }
+        cachedWindows = cached.filter { !windowIDs.contains($0.info.windowID) }
+    }
+
+    /// Re-probe one app off the main thread and replace its cache entries.
+    static func refreshAppAsync(pid: pid_t) {
+        refreshQueue.async {
+            mergeApp(pid: pid)
+        }
+    }
+
+    /// Topmost on-screen layer-0 window for a pid, if any. Used as a focus
+    /// fallback when AX hasn't published a focused window yet after launch.
+    static func topWindowID(for pid: pid_t) -> CGWindowID? {
+        cgWindows([.optionOnScreenOnly, .excludeDesktopElements])
+            .first { $0.pid == pid }?
+            .wid
+    }
+
     /// Cheap per-trigger view over the (cached) window list. Serves the last
     /// enumeration immediately and kicks a background refresh for next time;
-    /// only the very first call pays for a synchronous sweep.
+    /// only the very first call pays for a synchronous sweep. Also syncs the
+    /// cache both ways against the window server so creates/closes that raced
+    /// a background sweep are visible on this trigger.
     static func snapshot() -> Snapshot {
         cacheLock.lock()
         let cached = cachedWindows
@@ -93,21 +128,54 @@ enum WindowEnumerator {
             cacheLock.unlock()
         }
 
-        // The cache is always a beat behind: the background refresh that a quit
-        // or a closed window kicks off can't finish before an immediate
-        // re-trigger, so the list would still show windows that are gone.
-        // Asking the window server which ids are still alive is a cheap call
-        // (unlike the AX sweep that builds the cache), so it can run per
-        // trigger and drop the dead ones before they're ever displayed.
-        let live = Set(cgWindows([.optionAll, .excludeDesktopElements]).map { $0.wid })
-        ranked = ranked.filter { live.contains($0.info.windowID) }
+        let cgAll = cgWindows([.optionAll, .excludeDesktopElements])
+        let live = Set(cgAll.map(\.wid))
+        let cachedIDs = Set(ranked.map(\.info.windowID))
+
+        // Removals: drop ids the window server no longer lists, and persist
+        // that into the cache so the next trigger isn't one beat behind.
+        let dead = cachedIDs.subtracting(live)
+        if !dead.isEmpty {
+            ranked = ranked.filter { live.contains($0.info.windowID) }
+            remove(windowIDs: dead)
+        }
+
+        // Additions: probe only the apps that own brand-new ids (usually one).
+        let newcomers = live.subtracting(cachedIDs)
+        if !newcomers.isEmpty {
+            let myPID = ProcessInfo.processInfo.processIdentifier
+            let excluded = Set(Config.shared.excludedApps)
+            var pidsToProbe = Set<pid_t>()
+            for e in cgAll where newcomers.contains(e.wid) {
+                guard e.pid != myPID,
+                      let app = NSRunningApplication(processIdentifier: e.pid),
+                      app.activationPolicy == .regular,
+                      !excluded.contains(app.bundleIdentifier ?? ""),
+                      !excluded.contains(app.localizedName ?? "")
+                else { continue }
+                pidsToProbe.insert(e.pid)
+            }
+            for pid in pidsToProbe {
+                mergeApp(pid: pid)
+            }
+            cacheLock.lock()
+            ranked = cachedWindows ?? ranked
+            cacheLock.unlock()
+        }
 
         let activeDisplay = currentActiveDisplay()
         let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
 
         // Most-recently-used first, from our own focus history; windows not
         // focused since launch fall back to front-to-back stacking order.
-        let focus = FocusHistory.shared.timestamps()
+        // Frontmost focused window with no timestamp yet still ranks as "now"
+        // so a launch-race miss can't bury the current app at the end.
+        var focus = FocusHistory.shared.timestamps()
+        if let frontmostPID,
+           let frontWID = focusedWindowID(of: frontmostPID) ?? topWindowID(for: frontmostPID),
+           focus[frontWID] == nil {
+            focus[frontWID] = Date()
+        }
         let sorted = ranked.sorted { a, b in
             let ta = focus[a.info.windowID]
             let tb = focus[b.info.windowID]
@@ -118,9 +186,9 @@ enum WindowEnumerator {
             case (.none, .none): return (a.rank, a.order) < (b.rank, b.order)
             }
         }
-        let windows = sorted.map { $0.info }
+        let windows = sorted.map(\.info)
         let activeScreenWindowIDs = Set(
-            windows.filter { display(for: $0.frame) == activeDisplay }.map { $0.windowID }
+            windows.filter { display(for: $0.frame) == activeDisplay }.map(\.windowID)
         )
         return Snapshot(
             windows: windows,
@@ -128,6 +196,68 @@ enum WindowEnumerator {
             frontmostPID: frontmostPID,
             activeScreenWindowIDs: activeScreenWindowIDs
         )
+    }
+
+    // MARK: - Targeted merge
+
+    /// Probe `pid` and replace that app's entries in the cache.
+    @discardableResult
+    private static func mergeApp(pid: pid_t) -> Bool {
+        guard let app = NSRunningApplication(processIdentifier: pid),
+              app.activationPolicy == .regular else {
+            remove(pid: pid)
+            return false
+        }
+        let excluded = Set(Config.shared.excludedApps)
+        if excluded.contains(app.bundleIdentifier ?? "")
+            || excluded.contains(app.localizedName ?? "") {
+            remove(pid: pid)
+            return false
+        }
+
+        let cgAll = cgWindows([.optionAll, .excludeDesktopElements])
+        let boundsByID = Dictionary(cgAll.map { ($0.wid, $0.bounds) }, uniquingKeysWith: { a, _ in a })
+        let zRank = Dictionary(
+            cgWindows([.optionOnScreenOnly, .excludeDesktopElements]).enumerated()
+                .map { ($0.element.wid, $0.offset) },
+            uniquingKeysWith: { a, _ in a }
+        )
+        let expected = Set(cgAll.filter { $0.pid == pid }.map(\.wid))
+        let probed = windows(of: app, expected: expected)
+
+        var merged: [RankedWindow] = []
+        for (order, win) in probed.enumerated() {
+            let frame = boundsByID[win.wid] ?? win.axFrame
+            guard frame.width >= minWindowSize.width, frame.height >= minWindowSize.height else { continue }
+            let rank = zRank[win.wid] ?? Int.max
+            let info = WindowInfo(
+                ax: win.ax,
+                windowID: win.wid,
+                pid: pid,
+                appName: app.localizedName ?? "?",
+                icon: app.icon,
+                title: win.title.isEmpty ? (app.localizedName ?? "Untitled") : win.title,
+                frame: frame
+            )
+            merged.append(RankedWindow(rank: rank, order: order, info: info))
+        }
+
+        cacheLock.lock()
+        var base = cachedWindows ?? []
+        base.removeAll { $0.info.pid == pid }
+        base.append(contentsOf: merged)
+        cachedWindows = base
+        cacheLock.unlock()
+        return true
+    }
+
+    private static func focusedWindowID(of pid: pid_t) -> CGWindowID? {
+        let axApp = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(axApp, 0.25)
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &ref) == .success,
+              let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+        return PrivateAX.windowID(of: ref as! AXUIElement)
     }
 
     private static func enumerateWindows() -> [RankedWindow] {

@@ -105,24 +105,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // hung app's server can't stall the switcher for seconds. Per-element
         // timeouts still apply where set; this is the process-wide default.
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.25)
-        // Accessibility is granted at this point, so focus tracking works too.
+        // Accessibility is granted at this point, so focus tracking and
+        // event-driven cache upkeep work too.
         FocusHistory.shared.start()
+        WindowCacheObserver.shared.start()
         registerWorkspaceObservers()
         WindowEnumerator.refreshAsync()
         NSLog("Riffle: event tap active")
     }
 
-    // Keep the window cache fresh in the background so triggers stay instant.
+    // Keep the window cache fresh from workspace events. Launch/activate/space
+    // changes ask for a coalesced full sweep; terminate also prunes the pid
+    // immediately so a quit never lingers for one trigger.
     private func registerWorkspaceObservers() {
         let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(
+            self,
+            selector: #selector(appTerminated(_:)),
+            name: NSWorkspace.didTerminateApplicationNotification,
+            object: nil
+        )
         for name: NSNotification.Name in [
             NSWorkspace.didLaunchApplicationNotification,
-            NSWorkspace.didTerminateApplicationNotification,
             NSWorkspace.didActivateApplicationNotification,
             NSWorkspace.activeSpaceDidChangeNotification,
         ] {
             center.addObserver(self, selector: #selector(refreshWindowCache), name: name, object: nil)
         }
+    }
+
+    @objc private func appTerminated(_ note: Notification) {
+        if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+            WindowEnumerator.remove(pid: app.processIdentifier)
+        }
+        WindowEnumerator.refreshAsync()
     }
 
     @objc private func refreshWindowCache() {
