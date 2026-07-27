@@ -114,9 +114,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSLog("Riffle: event tap active")
     }
 
-    // Keep the window cache fresh from workspace events. Launch/activate/space
+    // Keep the window cache fresh from workspace events. Launch and Space
     // changes ask for a coalesced full sweep; terminate also prunes the pid
-    // immediately so a quit never lingers for one trigger.
+    // immediately so a quit never lingers for one trigger. App activation is
+    // intentionally omitted — FocusHistory handles MRU, and a full AX sweep on
+    // every focus change kept the refresh queue busy and the UI laggy.
     private func registerWorkspaceObservers() {
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(
@@ -127,7 +129,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         for name: NSNotification.Name in [
             NSWorkspace.didLaunchApplicationNotification,
-            NSWorkspace.didActivateApplicationNotification,
             NSWorkspace.activeSpaceDidChangeNotification,
         ] {
             center.addObserver(self, selector: #selector(refreshWindowCache), name: name, object: nil)

@@ -1,9 +1,14 @@
 import AppKit
 import ApplicationServices
 
-/// Event-driven cache upkeep: watches each regular app for window create/destroy
+/// Event-driven cache upkeep: watches each regular app for window creation
 /// and prunes on quit. Idle cost is roughly zero — observers only wake when
 /// something changes (no polling).
+///
+/// Deliberately does *not* observe `kAXUIElementDestroyedNotification`: that
+/// fires for every menu/button/cell teardown and would spam AX IPC across all
+/// apps. Closed windows are dropped cheaply via the CGWindowList diff in
+/// `WindowEnumerator.snapshot()`.
 final class WindowCacheObserver {
     static let shared = WindowCacheObserver()
 
@@ -64,9 +69,9 @@ final class WindowCacheObserver {
         guard AXObserverCreate(pid, callback, &obs) == .success, let obs else { return }
         let axApp = AXUIElementCreateApplication(pid)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        // Some apps reject individual notifications; keep watching the rest.
+        // Some apps reject the notification; that's fine — launch/space refresh
+        // and the snapshot CG diff still cover those.
         _ = AXObserverAddNotification(obs, axApp, kAXWindowCreatedNotification as CFString, refcon)
-        _ = AXObserverAddNotification(obs, axApp, kAXUIElementDestroyedNotification as CFString, refcon)
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
         observers[pid] = (obs, axApp)
     }
@@ -74,7 +79,6 @@ final class WindowCacheObserver {
     private func unwatch(_ pid: pid_t) {
         guard let entry = observers.removeValue(forKey: pid) else { return }
         AXObserverRemoveNotification(entry.obs, entry.app, kAXWindowCreatedNotification as CFString)
-        AXObserverRemoveNotification(entry.obs, entry.app, kAXUIElementDestroyedNotification as CFString)
         CFRunLoopRemoveSource(
             CFRunLoopGetMain(),
             AXObserverGetRunLoopSource(entry.obs),
@@ -83,27 +87,16 @@ final class WindowCacheObserver {
     }
 
     private func handle(element: AXUIElement, notification: String) {
-        if notification == kAXWindowCreatedNotification as String {
-            // Prefer a targeted probe for the owning app; fall back to a
-            // coalesced full sweep when the element hasn't got a window id yet.
-            if let wid = PrivateAX.windowID(of: element),
-               let pid = pid(ofWindowID: wid) {
-                WindowEnumerator.refreshAppAsync(pid: pid)
-            } else if let pid = pid(ofAXElement: element) {
-                WindowEnumerator.refreshAppAsync(pid: pid)
-            } else {
-                WindowEnumerator.refreshAsync()
-            }
-            return
-        }
-
-        if notification == kAXUIElementDestroyedNotification as String {
-            // This notification also fires for menus/buttons/etc. Only act when
-            // we can still resolve a window id — otherwise ignore and let the
-            // next snapshot's CG diff drop closed windows (avoids refresh spam).
-            if let wid = PrivateAX.windowID(of: element) {
-                WindowEnumerator.remove(windowIDs: [wid])
-            }
+        guard notification == kAXWindowCreatedNotification as String else { return }
+        // Targeted probe for the owning app; fall back to a coalesced full
+        // sweep only when we can't resolve a pid from the element.
+        if let pid = pid(ofAXElement: element) {
+            WindowEnumerator.refreshAppAsync(pid: pid)
+        } else if let wid = PrivateAX.windowID(of: element),
+                  let pid = pid(ofWindowID: wid) {
+            WindowEnumerator.refreshAppAsync(pid: pid)
+        } else {
+            WindowEnumerator.refreshAsync()
         }
     }
 

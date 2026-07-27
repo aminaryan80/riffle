@@ -40,6 +40,11 @@ enum WindowEnumerator {
     private static var cachedWindows: [RankedWindow]?
     private static var refreshInFlight = false
     private static var refreshStale = false
+    /// CG window ids we already probed and chose not to list (phantoms, minimized,
+    /// undersized, …). Without this, every snapshot treats them as "newcomers" and
+    /// re-probes their apps — the main-thread stall that made the switcher feel stuck.
+    private static var ignoredWindowIDs: Set<CGWindowID> = []
+    private static var pendingAppRefresh: Set<pid_t> = []
     private static let refreshQueue = DispatchQueue(label: "Riffle.WindowEnumerator.refresh")
 
     /// Rebuild the cached window list off the main thread. Coalesced: requests
@@ -93,9 +98,17 @@ enum WindowEnumerator {
     }
 
     /// Re-probe one app off the main thread and replace its cache entries.
+    /// Coalesced per pid so create-notification storms don't stack probes.
     static func refreshAppAsync(pid: pid_t) {
+        cacheLock.lock()
+        let schedule = pendingAppRefresh.insert(pid).inserted
+        cacheLock.unlock()
+        guard schedule else { return }
         refreshQueue.async {
-            mergeApp(pid: pid)
+            cacheLock.lock()
+            pendingAppRefresh.remove(pid)
+            cacheLock.unlock()
+            mergeApp(pid: pid, probeOtherSpaces: true)
         }
     }
 
@@ -108,10 +121,12 @@ enum WindowEnumerator {
     }
 
     /// Cheap per-trigger view over the (cached) window list. Serves the last
-    /// enumeration immediately and kicks a background refresh for next time;
-    /// only the very first call pays for a synchronous sweep. Also syncs the
-    /// cache both ways against the window server so creates/closes that raced
-    /// a background sweep are visible on this trigger.
+    /// enumeration immediately; only the very first call pays for a synchronous
+    /// sweep. Removals sync against the window server (cheap). New windows are
+    /// merged for the frontmost app via the public AX list only (no remote-token
+    /// scan); everything else is probed on the background queue. CG lists many
+    /// ids AX rejects (helpers, minimized) — those are remembered as ignored
+    /// so they don't re-trigger probes on every Cmd+Tab.
     static func snapshot() -> Snapshot {
         cacheLock.lock()
         let cached = cachedWindows
@@ -120,7 +135,6 @@ enum WindowEnumerator {
         var ranked: [RankedWindow]
         if let cached {
             ranked = cached
-            refreshAsync()
         } else {
             ranked = enumerateWindows()
             cacheLock.lock()
@@ -140,31 +154,56 @@ enum WindowEnumerator {
             remove(windowIDs: dead)
         }
 
-        // Additions: probe only the apps that own brand-new ids (usually one).
-        let newcomers = live.subtracting(cachedIDs)
+        let activeDisplay = currentActiveDisplay()
+        let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+
+        // Forget ignored ids that are gone; schedule background probes only for
+        // plausible not-yet-seen windows (large enough to be real).
+        cacheLock.lock()
+        ignoredWindowIDs = ignoredWindowIDs.intersection(live)
+        let ignored = ignoredWindowIDs
+        cacheLock.unlock()
+
+        let newcomers = live.subtracting(cachedIDs).subtracting(ignored)
         if !newcomers.isEmpty {
             let myPID = ProcessInfo.processInfo.processIdentifier
             let excluded = Set(Config.shared.excludedApps)
             var pidsToProbe = Set<pid_t>()
+            var rejectNow: Set<CGWindowID> = []
             for e in cgAll where newcomers.contains(e.wid) {
+                if e.bounds.width < minWindowSize.width || e.bounds.height < minWindowSize.height {
+                    rejectNow.insert(e.wid)
+                    continue
+                }
                 guard e.pid != myPID,
                       let app = NSRunningApplication(processIdentifier: e.pid),
                       app.activationPolicy == .regular,
                       !excluded.contains(app.bundleIdentifier ?? ""),
                       !excluded.contains(app.localizedName ?? "")
-                else { continue }
+                else {
+                    rejectNow.insert(e.wid)
+                    continue
+                }
                 pidsToProbe.insert(e.pid)
             }
-            for pid in pidsToProbe {
-                mergeApp(pid: pid)
+            if !rejectNow.isEmpty {
+                cacheLock.lock()
+                ignoredWindowIDs.formUnion(rejectNow)
+                cacheLock.unlock()
             }
-            cacheLock.lock()
-            ranked = cachedWindows ?? ranked
-            cacheLock.unlock()
+            // Frontmost only: cheap current-Space AX list (no remote-token scan)
+            // so a just-opened window shows on this trigger. Full cross-Space
+            // probe stays on the background queue for every affected pid.
+            if let frontmostPID, pidsToProbe.contains(frontmostPID) {
+                mergeApp(pid: frontmostPID, probeOtherSpaces: false)
+                cacheLock.lock()
+                ranked = cachedWindows ?? ranked
+                cacheLock.unlock()
+            }
+            for pid in pidsToProbe {
+                refreshAppAsync(pid: pid)
+            }
         }
-
-        let activeDisplay = currentActiveDisplay()
-        let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
 
         // Most-recently-used first, from our own focus history; windows not
         // focused since launch fall back to front-to-back stacking order.
@@ -201,8 +240,11 @@ enum WindowEnumerator {
     // MARK: - Targeted merge
 
     /// Probe `pid` and replace that app's entries in the cache.
+    /// - Parameter probeOtherSpaces: when false, only the public AX window list
+    ///   is used (fast enough for the main-thread snapshot path). When true,
+    ///   the remote-token scan also finds windows on other Spaces.
     @discardableResult
-    private static func mergeApp(pid: pid_t) -> Bool {
+    private static func mergeApp(pid: pid_t, probeOtherSpaces: Bool) -> Bool {
         guard let app = NSRunningApplication(processIdentifier: pid),
               app.activationPolicy == .regular else {
             remove(pid: pid)
@@ -223,7 +265,8 @@ enum WindowEnumerator {
             uniquingKeysWith: { a, _ in a }
         )
         let expected = Set(cgAll.filter { $0.pid == pid }.map(\.wid))
-        let probed = windows(of: app, expected: expected)
+        let probed = windows(of: app, expected: expected, probeOtherSpaces: probeOtherSpaces)
+        let accepted = Set(probed.map(\.wid))
 
         var merged: [RankedWindow] = []
         for (order, win) in probed.enumerated() {
@@ -242,11 +285,39 @@ enum WindowEnumerator {
             merged.append(RankedWindow(rank: rank, order: order, info: info))
         }
 
+        // Only remember permanent rejects after a full probe. A current-Space-only
+        // pass hasn't looked at other Spaces, so missing ids may still be real.
+        let rejected: Set<CGWindowID> = probeOtherSpaces
+            ? expected.subtracting(accepted).union(
+                Set(probed.compactMap { win -> CGWindowID? in
+                    let frame = boundsByID[win.wid] ?? win.axFrame
+                    return (frame.width < minWindowSize.width || frame.height < minWindowSize.height)
+                        ? win.wid : nil
+                })
+            )
+            : Set(probed.compactMap { win -> CGWindowID? in
+                let frame = boundsByID[win.wid] ?? win.axFrame
+                return (frame.width < minWindowSize.width || frame.height < minWindowSize.height)
+                    ? win.wid : nil
+            })
+
         cacheLock.lock()
         var base = cachedWindows ?? []
-        base.removeAll { $0.info.pid == pid }
+        // Current-Space merge must not wipe other-Space windows we already know.
+        if probeOtherSpaces {
+            base.removeAll { $0.info.pid == pid }
+        } else {
+            let replaced = Set(merged.map(\.info.windowID))
+            base.removeAll { $0.info.pid == pid && replaced.contains($0.info.windowID) }
+            // Also drop dead ones for this pid that CG no longer lists.
+            base.removeAll { $0.info.pid == pid && !expected.contains($0.info.windowID) }
+            // Prefer newly probed entries when both exist.
+            base.removeAll { replaced.contains($0.info.windowID) }
+        }
         base.append(contentsOf: merged)
         cachedWindows = base
+        ignoredWindowIDs.formUnion(rejected)
+        ignoredWindowIDs.subtract(accepted)
         cacheLock.unlock()
         return true
     }
@@ -289,7 +360,7 @@ enum WindowEnumerator {
         DispatchQueue.concurrentPerform(iterations: apps.count) { i in
             let app = apps[i]
             let expected = expectedByPID[app.processIdentifier] ?? []
-            for (order, win) in windows(of: app, expected: expected).enumerated() {
+            for (order, win) in windows(of: app, expected: expected, probeOtherSpaces: true).enumerated() {
                 // Prefer the window server's idea of the frame: unlike the AX
                 // frame it is also correct for windows in other Spaces.
                 let frame = boundsByID[win.wid] ?? win.axFrame
@@ -311,6 +382,15 @@ enum WindowEnumerator {
             }
         }
         FocusHistory.shared.prune(keeping: Set(boundsByID.keys))
+        let accepted = Set(ranked.map(\.info.windowID))
+        let trackablePIDs = Set(apps.map(\.processIdentifier))
+        let rejected = Set(cgAll.compactMap { e -> CGWindowID? in
+            trackablePIDs.contains(e.pid) && !accepted.contains(e.wid) ? e.wid : nil
+        })
+        cacheLock.lock()
+        ignoredWindowIDs = ignoredWindowIDs.intersection(Set(boundsByID.keys)).union(rejected)
+        ignoredWindowIDs.subtract(accepted)
+        cacheLock.unlock()
         return ranked
     }
 
@@ -337,7 +417,11 @@ enum WindowEnumerator {
     /// All standard windows of an app, across all Spaces: the public window
     /// list (current Space) merged with a remote-token probe (which also
     /// finds windows in other Spaces). Minimized windows are excluded.
-    private static func windows(of app: NSRunningApplication, expected: Set<CGWindowID>) -> [AppWindow] {
+    private static func windows(
+        of app: NSRunningApplication,
+        expected: Set<CGWindowID>,
+        probeOtherSpaces: Bool
+    ) -> [AppWindow] {
         let pid = app.processIdentifier
         var byID: [CGWindowID: AXUIElement] = [:]
         var order: [CGWindowID] = []
@@ -381,7 +465,7 @@ enum WindowEnumerator {
         // could never satisfy the exit and ate the full probe, plus its entire
         // time budget, on every sweep — to find the nothing we already knew about.
         let covered = { seen.isSuperset(of: expected) }
-        if !covered() {
+        if probeOtherSpaces && !covered() {
             let deadline = Date().addingTimeInterval(perAppBudget)
             for axId in 0..<bruteForceRange {
                 if axId % 64 == 0 && Date() > deadline { break }

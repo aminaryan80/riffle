@@ -70,15 +70,14 @@ final class SwitcherController {
         reset()
         WindowEnumerator.focus(target)
         FocusHistory.shared.record(target.windowID)
-        // Focus just changed and the user may re-trigger immediately; warm the
-        // cache now so the next session shows without a synchronous sweep.
-        WindowEnumerator.refreshAsync()
+        // Focus just changed; a full sweep is overkill — refresh the target app
+        // so the next trigger sees updated z-order/title without scanning everyone.
+        WindowEnumerator.refreshAppAsync(pid: target.pid)
     }
 
     func cancel() {
         guard isActive else { return }
         reset()
-        WindowEnumerator.refreshAsync()
     }
 
     func step(backwards: Bool) {
