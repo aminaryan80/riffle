@@ -40,10 +40,14 @@ enum WindowEnumerator {
     private static var cachedWindows: [RankedWindow]?
     private static var refreshInFlight = false
     private static var refreshStale = false
-    /// CG window ids we already probed and chose not to list (phantoms, minimized,
+    /// CG window ids we already probed and chose not to list (phantoms,
     /// undersized, …). Without this, every snapshot treats them as "newcomers" and
     /// re-probes their apps — the main-thread stall that made the switcher feel stuck.
+    /// Minimized windows are tracked separately so they can reappear on deminiaturize.
     private static var ignoredWindowIDs: Set<CGWindowID> = []
+    /// Windows known to be minimized (yellow-button). Still in CGWindowList, so the
+    /// dead-id prune won't catch them; they must be filtered explicitly.
+    private static var minimizedWindowIDs: Set<CGWindowID> = []
     private static var pendingAppRefresh: Set<pid_t> = []
     private static let refreshQueue = DispatchQueue(label: "Riffle.WindowEnumerator.refresh")
 
@@ -95,6 +99,26 @@ enum WindowEnumerator {
         defer { cacheLock.unlock() }
         guard let cached = cachedWindows else { return }
         cachedWindows = cached.filter { !windowIDs.contains($0.info.windowID) }
+        minimizedWindowIDs.subtract(windowIDs)
+    }
+
+    /// Yellow-button minimize / restore. Minimized windows stay in CGWindowList,
+    /// so callers must tell us explicitly.
+    static func setMinimized(_ windowID: CGWindowID, minimized: Bool) {
+        cacheLock.lock()
+        if minimized {
+            minimizedWindowIDs.insert(windowID)
+            if let cached = cachedWindows {
+                cachedWindows = cached.filter { $0.info.windowID != windowID }
+            }
+        } else {
+            minimizedWindowIDs.remove(windowID)
+            ignoredWindowIDs.remove(windowID)
+        }
+        cacheLock.unlock()
+        if !minimized, let pid = pid(ofWindowID: windowID) {
+            refreshAppAsync(pid: pid)
+        }
     }
 
     /// Re-probe one app off the main thread and replace its cache entries.
@@ -144,6 +168,7 @@ enum WindowEnumerator {
 
         let cgAll = cgWindows([.optionAll, .excludeDesktopElements])
         let live = Set(cgAll.map(\.wid))
+        let onScreen = Set(cgWindows([.optionOnScreenOnly, .excludeDesktopElements]).map(\.wid))
         let cachedIDs = Set(ranked.map(\.info.windowID))
 
         // Removals: drop ids the window server no longer lists, and persist
@@ -154,14 +179,44 @@ enum WindowEnumerator {
             remove(windowIDs: dead)
         }
 
+        // Hidden apps (⌘H) and minimized windows still appear in CGWindowList,
+        // so the dead-id prune above won't remove them. Drop them here.
+        var newlyMinimized: Set<CGWindowID> = []
+        ranked = ranked.filter { entry in
+            if let app = NSRunningApplication(processIdentifier: entry.info.pid), app.isHidden {
+                return false
+            }
+            cacheLock.lock()
+            let knownMinimized = minimizedWindowIDs.contains(entry.info.windowID)
+            cacheLock.unlock()
+            if knownMinimized { return false }
+            // On-screen ⇒ not minimized. Off-screen is either another Space
+            // (keep) or minimized without a notification (check AX).
+            if onScreen.contains(entry.info.windowID) { return true }
+            if boolAttr(entry.info.ax, kAXMinimizedAttribute) {
+                newlyMinimized.insert(entry.info.windowID)
+                return false
+            }
+            return true
+        }
+        if !newlyMinimized.isEmpty {
+            cacheLock.lock()
+            minimizedWindowIDs.formUnion(newlyMinimized)
+            if let cached = cachedWindows {
+                cachedWindows = cached.filter { !newlyMinimized.contains($0.info.windowID) }
+            }
+            cacheLock.unlock()
+        }
+
         let activeDisplay = currentActiveDisplay()
         let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
 
-        // Forget ignored ids that are gone; schedule background probes only for
-        // plausible not-yet-seen windows (large enough to be real).
+        // Forget ignored/minimized ids that are gone; schedule background probes
+        // only for plausible not-yet-seen windows (large enough to be real).
         cacheLock.lock()
         ignoredWindowIDs = ignoredWindowIDs.intersection(live)
-        let ignored = ignoredWindowIDs
+        minimizedWindowIDs = minimizedWindowIDs.intersection(live)
+        let ignored = ignoredWindowIDs.union(minimizedWindowIDs)
         cacheLock.unlock()
 
         let newcomers = live.subtracting(cachedIDs).subtracting(ignored)
@@ -266,10 +321,11 @@ enum WindowEnumerator {
         )
         let expected = Set(cgAll.filter { $0.pid == pid }.map(\.wid))
         let probed = windows(of: app, expected: expected, probeOtherSpaces: probeOtherSpaces)
-        let accepted = Set(probed.map(\.wid))
+        let accepted = Set(probed.windows.map(\.wid))
+        let minimized = probed.minimizedIDs
 
         var merged: [RankedWindow] = []
-        for (order, win) in probed.enumerated() {
+        for (order, win) in probed.windows.enumerated() {
             let frame = boundsByID[win.wid] ?? win.axFrame
             guard frame.width >= minWindowSize.width, frame.height >= minWindowSize.height else { continue }
             let rank = zRank[win.wid] ?? Int.max
@@ -285,21 +341,16 @@ enum WindowEnumerator {
             merged.append(RankedWindow(rank: rank, order: order, info: info))
         }
 
-        // Only remember permanent rejects after a full probe. A current-Space-only
-        // pass hasn't looked at other Spaces, so missing ids may still be real.
+        // Permanent rejects only (phantoms/undersized). Minimized ids are tracked
+        // separately so restoring a window can bring it back.
+        let undersized = Set(probed.windows.compactMap { win -> CGWindowID? in
+            let frame = boundsByID[win.wid] ?? win.axFrame
+            return (frame.width < minWindowSize.width || frame.height < minWindowSize.height)
+                ? win.wid : nil
+        })
         let rejected: Set<CGWindowID> = probeOtherSpaces
-            ? expected.subtracting(accepted).union(
-                Set(probed.compactMap { win -> CGWindowID? in
-                    let frame = boundsByID[win.wid] ?? win.axFrame
-                    return (frame.width < minWindowSize.width || frame.height < minWindowSize.height)
-                        ? win.wid : nil
-                })
-            )
-            : Set(probed.compactMap { win -> CGWindowID? in
-                let frame = boundsByID[win.wid] ?? win.axFrame
-                return (frame.width < minWindowSize.width || frame.height < minWindowSize.height)
-                    ? win.wid : nil
-            })
+            ? expected.subtracting(accepted).subtracting(minimized).union(undersized)
+            : undersized
 
         cacheLock.lock()
         var base = cachedWindows ?? []
@@ -314,12 +365,24 @@ enum WindowEnumerator {
             // Prefer newly probed entries when both exist.
             base.removeAll { replaced.contains($0.info.windowID) }
         }
+        // Minimized windows must not linger in the shown cache.
+        base.removeAll { minimized.contains($0.info.windowID) }
         base.append(contentsOf: merged)
         cachedWindows = base
         ignoredWindowIDs.formUnion(rejected)
         ignoredWindowIDs.subtract(accepted)
+        minimizedWindowIDs.formUnion(minimized)
+        minimizedWindowIDs.subtract(accepted)
         cacheLock.unlock()
         return true
+    }
+
+    private static func pid(ofWindowID wid: CGWindowID) -> pid_t? {
+        guard let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], wid) as? [[String: Any]],
+              let info = list.first,
+              let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+        else { return nil }
+        return pid
     }
 
     private static func focusedWindowID(of pid: pid_t) -> CGWindowID? {
@@ -357,10 +420,13 @@ enum WindowEnumerator {
         // so the sweep is bounded by the slowest app, not the sum.
         let lock = NSLock()
         var ranked: [RankedWindow] = []
+        var foundMinimized: Set<CGWindowID> = []
         DispatchQueue.concurrentPerform(iterations: apps.count) { i in
             let app = apps[i]
             let expected = expectedByPID[app.processIdentifier] ?? []
-            for (order, win) in windows(of: app, expected: expected, probeOtherSpaces: true).enumerated() {
+            let probed = windows(of: app, expected: expected, probeOtherSpaces: true)
+            var local: [RankedWindow] = []
+            for (order, win) in probed.windows.enumerated() {
                 // Prefer the window server's idea of the frame: unlike the AX
                 // frame it is also correct for windows in other Spaces.
                 let frame = boundsByID[win.wid] ?? win.axFrame
@@ -376,20 +442,31 @@ enum WindowEnumerator {
                     title: win.title.isEmpty ? (app.localizedName ?? "Untitled") : win.title,
                     frame: frame
                 )
-                lock.lock()
-                ranked.append(RankedWindow(rank: rank, order: i * 10_000 + order, info: info))
-                lock.unlock()
+                local.append(RankedWindow(rank: rank, order: i * 10_000 + order, info: info))
             }
+            lock.lock()
+            ranked.append(contentsOf: local)
+            foundMinimized.formUnion(probed.minimizedIDs)
+            lock.unlock()
         }
         FocusHistory.shared.prune(keeping: Set(boundsByID.keys))
         let accepted = Set(ranked.map(\.info.windowID))
         let trackablePIDs = Set(apps.map(\.processIdentifier))
+        // On-screen CG ids that AX didn't accept and aren't minimized are phantoms.
+        let onScreenIDs = Set(zRank.keys)
         let rejected = Set(cgAll.compactMap { e -> CGWindowID? in
-            trackablePIDs.contains(e.pid) && !accepted.contains(e.wid) ? e.wid : nil
+            guard trackablePIDs.contains(e.pid),
+                  !accepted.contains(e.wid),
+                  !foundMinimized.contains(e.wid),
+                  onScreenIDs.contains(e.wid)
+            else { return nil }
+            return e.wid
         })
         cacheLock.lock()
         ignoredWindowIDs = ignoredWindowIDs.intersection(Set(boundsByID.keys)).union(rejected)
         ignoredWindowIDs.subtract(accepted)
+        minimizedWindowIDs = minimizedWindowIDs.intersection(Set(boundsByID.keys)).union(foundMinimized)
+        minimizedWindowIDs.subtract(accepted)
         cacheLock.unlock()
         return ranked
     }
@@ -414,14 +491,20 @@ enum WindowEnumerator {
         let axFrame: CGRect
     }
 
+    private struct AppProbeResult {
+        let windows: [AppWindow]
+        let minimizedIDs: Set<CGWindowID>
+    }
+
     /// All standard windows of an app, across all Spaces: the public window
     /// list (current Space) merged with a remote-token probe (which also
-    /// finds windows in other Spaces). Minimized windows are excluded.
+    /// finds windows in other Spaces). Minimized windows are excluded from
+    /// `windows` but reported in `minimizedIDs`.
     private static func windows(
         of app: NSRunningApplication,
         expected: Set<CGWindowID>,
         probeOtherSpaces: Bool
-    ) -> [AppWindow] {
+    ) -> AppProbeResult {
         let pid = app.processIdentifier
         var byID: [CGWindowID: AXUIElement] = [:]
         var order: [CGWindowID] = []
@@ -429,6 +512,7 @@ enum WindowEnumerator {
         // (minimized windows, sub-elements). Drives the probe's early exit;
         // tracking rejects too keeps a minimized window from stalling the loop.
         var seen: Set<CGWindowID> = []
+        var minimizedIDs: Set<CGWindowID> = []
 
         // Check the subrole at insertion time: the remote-token probe also
         // resolves sub-elements (close buttons etc.) that report the same
@@ -438,10 +522,13 @@ enum WindowEnumerator {
         func insert(_ el: AXUIElement) {
             guard let wid = PrivateAX.windowID(of: el) else { return }
             seen.insert(wid)
+            if boolAttr(el, kAXMinimizedAttribute) {
+                minimizedIDs.insert(wid)
+                return
+            }
             guard byID[wid] == nil,
                   stringAttr(el, kAXSubroleAttribute) == kAXStandardWindowSubrole as String,
-                  hasAttr(el, kAXCloseButtonAttribute),
-                  !boolAttr(el, kAXMinimizedAttribute)
+                  hasAttr(el, kAXCloseButtonAttribute)
             else { return }
             byID[wid] = el
             order.append(wid)
@@ -475,7 +562,7 @@ enum WindowEnumerator {
             }
         }
 
-        return order.compactMap { wid in
+        let windows = order.compactMap { wid -> AppWindow? in
             guard let el = byID[wid] else { return nil }
             return AppWindow(
                 ax: el,
@@ -484,6 +571,7 @@ enum WindowEnumerator {
                 axFrame: frame(of: el)
             )
         }
+        return AppProbeResult(windows: windows, minimizedIDs: minimizedIDs)
     }
 
     // MARK: - CG window list

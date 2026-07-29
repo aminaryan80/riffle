@@ -1,9 +1,9 @@
 import AppKit
 import ApplicationServices
 
-/// Event-driven cache upkeep: watches each regular app for window creation
-/// and prunes on quit. Idle cost is roughly zero — observers only wake when
-/// something changes (no polling).
+/// Event-driven cache upkeep: watches each regular app for window create /
+/// minimize / restore, and prunes on quit. Idle cost is roughly zero —
+/// observers only wake when something changes (no polling).
 ///
 /// Deliberately does *not* observe `kAXUIElementDestroyedNotification`: that
 /// fires for every menu/button/cell teardown and would spam AX IPC across all
@@ -33,6 +33,14 @@ final class WindowCacheObserver {
             name: NSWorkspace.didTerminateApplicationNotification,
             object: nil
         )
+        // ⌘H / Unhide: windows stay in CGWindowList, so snapshot filters on
+        // isHidden; refresh on unhide so titles/z-order are current.
+        center.addObserver(
+            self,
+            selector: #selector(appUnhidden(_:)),
+            name: NSWorkspace.didUnhideApplicationNotification,
+            object: nil
+        )
         for app in NSWorkspace.shared.runningApplications where isTrackable(app) {
             watch(app)
         }
@@ -52,6 +60,12 @@ final class WindowCacheObserver {
         WindowEnumerator.remove(pid: pid)
     }
 
+    @objc private func appUnhidden(_ note: Notification) {
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              isTrackable(app) else { return }
+        WindowEnumerator.refreshAppAsync(pid: app.processIdentifier)
+    }
+
     private func isTrackable(_ app: NSRunningApplication) -> Bool {
         app.activationPolicy == .regular && app.processIdentifier != myPID
     }
@@ -69,9 +83,10 @@ final class WindowCacheObserver {
         guard AXObserverCreate(pid, callback, &obs) == .success, let obs else { return }
         let axApp = AXUIElementCreateApplication(pid)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        // Some apps reject the notification; that's fine — launch/space refresh
-        // and the snapshot CG diff still cover those.
+        // Some apps reject individual notifications; keep watching the rest.
         _ = AXObserverAddNotification(obs, axApp, kAXWindowCreatedNotification as CFString, refcon)
+        _ = AXObserverAddNotification(obs, axApp, kAXWindowMiniaturizedNotification as CFString, refcon)
+        _ = AXObserverAddNotification(obs, axApp, kAXWindowDeminiaturizedNotification as CFString, refcon)
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
         observers[pid] = (obs, axApp)
     }
@@ -79,6 +94,8 @@ final class WindowCacheObserver {
     private func unwatch(_ pid: pid_t) {
         guard let entry = observers.removeValue(forKey: pid) else { return }
         AXObserverRemoveNotification(entry.obs, entry.app, kAXWindowCreatedNotification as CFString)
+        AXObserverRemoveNotification(entry.obs, entry.app, kAXWindowMiniaturizedNotification as CFString)
+        AXObserverRemoveNotification(entry.obs, entry.app, kAXWindowDeminiaturizedNotification as CFString)
         CFRunLoopRemoveSource(
             CFRunLoopGetMain(),
             AXObserverGetRunLoopSource(entry.obs),
@@ -87,6 +104,24 @@ final class WindowCacheObserver {
     }
 
     private func handle(element: AXUIElement, notification: String) {
+        if notification == kAXWindowMiniaturizedNotification as String {
+            if let wid = PrivateAX.windowID(of: element) {
+                WindowEnumerator.setMinimized(wid, minimized: true)
+            } else if let pid = pid(ofAXElement: element) {
+                WindowEnumerator.refreshAppAsync(pid: pid)
+            }
+            return
+        }
+
+        if notification == kAXWindowDeminiaturizedNotification as String {
+            if let wid = PrivateAX.windowID(of: element) {
+                WindowEnumerator.setMinimized(wid, minimized: false)
+            } else if let pid = pid(ofAXElement: element) {
+                WindowEnumerator.refreshAppAsync(pid: pid)
+            }
+            return
+        }
+
         guard notification == kAXWindowCreatedNotification as String else { return }
         // Targeted probe for the owning app; fall back to a coalesced full
         // sweep only when we can't resolve a pid from the element.
