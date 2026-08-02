@@ -186,13 +186,16 @@ enum WindowEnumerator {
             if let app = NSRunningApplication(processIdentifier: entry.info.pid), app.isHidden {
                 return false
             }
+            // On-screen ⇒ not minimized (minimized windows live in the Dock).
+            // Checked before the minimized set so a stale flag from a missed
+            // deminiaturize notification can't hide a visible window.
+            if onScreen.contains(entry.info.windowID) { return true }
             cacheLock.lock()
             let knownMinimized = minimizedWindowIDs.contains(entry.info.windowID)
             cacheLock.unlock()
             if knownMinimized { return false }
-            // On-screen ⇒ not minimized. Off-screen is either another Space
-            // (keep) or minimized without a notification (check AX).
-            if onScreen.contains(entry.info.windowID) { return true }
+            // Off-screen is either another Space (keep) or minimized without
+            // a notification (check AX).
             if boolAttr(entry.info.ax, kAXMinimizedAttribute) {
                 newlyMinimized.insert(entry.info.windowID)
                 return false
@@ -215,7 +218,10 @@ enum WindowEnumerator {
         // only for plausible not-yet-seen windows (large enough to be real).
         cacheLock.lock()
         ignoredWindowIDs = ignoredWindowIDs.intersection(live)
-        minimizedWindowIDs = minimizedWindowIDs.intersection(live)
+        // An on-screen id can't be minimized: clear stale flags (missed
+        // deminiaturize notifications) so such windows re-enter as newcomers
+        // below instead of staying invisible forever.
+        minimizedWindowIDs = minimizedWindowIDs.intersection(live).subtracting(onScreen)
         let ignored = ignoredWindowIDs.union(minimizedWindowIDs)
         cacheLock.unlock()
 
@@ -342,20 +348,25 @@ enum WindowEnumerator {
         }
 
         // Permanent rejects only (phantoms/undersized). Minimized ids are tracked
-        // separately so restoring a window can bring it back.
+        // separately so restoring a window can bring it back. Ids an *incomplete*
+        // probe failed to resolve are unknowns, not phantoms — poisoning them
+        // into ignoredWindowIDs made windows vanish for good after one AX
+        // timeout, because snapshot() never re-probes ignored ids.
         let undersized = Set(probed.windows.compactMap { win -> CGWindowID? in
             let frame = boundsByID[win.wid] ?? win.axFrame
             return (frame.width < minWindowSize.width || frame.height < minWindowSize.height)
                 ? win.wid : nil
         })
-        let rejected: Set<CGWindowID> = probeOtherSpaces
+        let rejected: Set<CGWindowID> = (probeOtherSpaces && probed.complete)
             ? expected.subtracting(accepted).subtracting(minimized).union(undersized)
             : undersized
 
         cacheLock.lock()
         var base = cachedWindows ?? []
-        // Current-Space merge must not wipe other-Space windows we already know.
-        if probeOtherSpaces {
+        // Only a complete cross-Space probe may wipe the app's cache wholesale.
+        // A current-Space merge must not drop other-Space windows we already
+        // know, and an incomplete probe must not drop windows it merely missed.
+        if probeOtherSpaces && probed.complete {
             base.removeAll { $0.info.pid == pid }
         } else {
             let replaced = Set(merged.map(\.info.windowID))
@@ -421,6 +432,7 @@ enum WindowEnumerator {
         let lock = NSLock()
         var ranked: [RankedWindow] = []
         var foundMinimized: Set<CGWindowID> = []
+        var completePIDs: Set<pid_t> = []
         DispatchQueue.concurrentPerform(iterations: apps.count) { i in
             let app = apps[i]
             let expected = expectedByPID[app.processIdentifier] ?? []
@@ -447,15 +459,17 @@ enum WindowEnumerator {
             lock.lock()
             ranked.append(contentsOf: local)
             foundMinimized.formUnion(probed.minimizedIDs)
+            if probed.complete { completePIDs.insert(app.processIdentifier) }
             lock.unlock()
         }
         FocusHistory.shared.prune(keeping: Set(boundsByID.keys))
         let accepted = Set(ranked.map(\.info.windowID))
-        let trackablePIDs = Set(apps.map(\.processIdentifier))
-        // On-screen CG ids that AX didn't accept and aren't minimized are phantoms.
+        // On-screen CG ids that AX didn't accept and aren't minimized are
+        // phantoms — but only if that app's probe was complete. After a
+        // timed-out probe the misses are unknowns and must stay probeable.
         let onScreenIDs = Set(zRank.keys)
         let rejected = Set(cgAll.compactMap { e -> CGWindowID? in
-            guard trackablePIDs.contains(e.pid),
+            guard completePIDs.contains(e.pid),
                   !accepted.contains(e.wid),
                   !foundMinimized.contains(e.wid),
                   onScreenIDs.contains(e.wid)
@@ -494,6 +508,10 @@ enum WindowEnumerator {
     private struct AppProbeResult {
         let windows: [AppWindow]
         let minimizedIDs: Set<CGWindowID>
+        /// False when the AX list read failed or the remote-token scan ran out
+        /// of budget: window ids the probe didn't resolve are then unknowns,
+        /// not phantoms, and must not be added to `ignoredWindowIDs`.
+        let complete: Bool
     }
 
     /// All standard windows of an app, across all Spaces: the public window
@@ -537,8 +555,10 @@ enum WindowEnumerator {
         let axApp = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(axApp, 0.25)
         var listRef: CFTypeRef?
+        var listOK = false
         if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &listRef) == .success,
            let list = listRef as? [AXUIElement] {
+            listOK = true
             list.forEach(insert)
         }
 
@@ -552,10 +572,14 @@ enum WindowEnumerator {
         // could never satisfy the exit and ate the full probe, plus its entire
         // time budget, on every sweep — to find the nothing we already knew about.
         let covered = { seen.isSuperset(of: expected) }
+        var timedOut = false
         if probeOtherSpaces && !covered() {
             let deadline = Date().addingTimeInterval(perAppBudget)
             for axId in 0..<bruteForceRange {
-                if axId % 64 == 0 && Date() > deadline { break }
+                if axId % 64 == 0 && Date() > deadline {
+                    timedOut = true
+                    break
+                }
                 guard let el = PrivateAX.remoteTokenElement(pid: pid, axId: axId) else { continue }
                 insert(el)
                 if covered() { break }
@@ -571,7 +595,11 @@ enum WindowEnumerator {
                 axFrame: frame(of: el)
             )
         }
-        return AppProbeResult(windows: windows, minimizedIDs: minimizedIDs)
+        return AppProbeResult(
+            windows: windows,
+            minimizedIDs: minimizedIDs,
+            complete: covered() || (listOK && !timedOut)
+        )
     }
 
     // MARK: - CG window list
