@@ -48,6 +48,13 @@ enum WindowEnumerator {
     /// Windows known to be minimized (yellow-button). Still in CGWindowList, so the
     /// dead-id prune won't catch them; they must be filtered explicitly.
     private static var minimizedWindowIDs: Set<CGWindowID> = []
+    /// Off-screen (other-Space) ids a *finished* probe still couldn't resolve —
+    /// typically Chrome windows whose AX element ids sit beyond the brute-force
+    /// range. Not phantoms (they may be real) and not listable (no AX element),
+    /// so they're excluded from the newcomer path to avoid re-probing the app
+    /// on every trigger. Cleared per-id the moment the id turns up on screen
+    /// (its Space was visited), at which point the probe can finally reach it.
+    private static var unreachableWindowIDs: Set<CGWindowID> = []
     private static var pendingAppRefresh: Set<pid_t> = []
     private static let refreshQueue = DispatchQueue(label: "Riffle.WindowEnumerator.refresh")
 
@@ -100,6 +107,7 @@ enum WindowEnumerator {
         guard let cached = cachedWindows else { return }
         cachedWindows = cached.filter { !windowIDs.contains($0.info.windowID) }
         minimizedWindowIDs.subtract(windowIDs)
+        unreachableWindowIDs.subtract(windowIDs)
     }
 
     /// Yellow-button minimize / restore. Minimized windows stay in CGWindowList,
@@ -114,6 +122,7 @@ enum WindowEnumerator {
         } else {
             minimizedWindowIDs.remove(windowID)
             ignoredWindowIDs.remove(windowID)
+            unreachableWindowIDs.remove(windowID)
         }
         cacheLock.unlock()
         if !minimized, let pid = pid(ofWindowID: windowID) {
@@ -222,7 +231,11 @@ enum WindowEnumerator {
         // deminiaturize notifications) so such windows re-enter as newcomers
         // below instead of staying invisible forever.
         minimizedWindowIDs = minimizedWindowIDs.intersection(live).subtracting(onScreen)
-        let ignored = ignoredWindowIDs.union(minimizedWindowIDs)
+        // An unreachable id turning up on screen means its Space was just
+        // visited — the probe can reach it now, so let it re-enter as a
+        // newcomer and get picked up.
+        unreachableWindowIDs = unreachableWindowIDs.intersection(live).subtracting(onScreen)
+        let ignored = ignoredWindowIDs.union(minimizedWindowIDs).union(unreachableWindowIDs)
         cacheLock.unlock()
 
         let newcomers = live.subtracting(cachedIDs).subtracting(ignored)
@@ -325,10 +338,12 @@ enum WindowEnumerator {
                 .map { ($0.element.wid, $0.offset) },
             uniquingKeysWith: { a, _ in a }
         )
+        let onScreenIDs = Set(zRank.keys)
         let expected = Set(cgAll.filter { $0.pid == pid }.map(\.wid))
         let probed = windows(of: app, expected: expected, probeOtherSpaces: probeOtherSpaces)
         let accepted = Set(probed.windows.map(\.wid))
         let minimized = probed.minimizedIDs
+        let seen = probed.seenIDs
 
         var merged: [RankedWindow] = []
         for (order, win) in probed.windows.enumerated() {
@@ -348,34 +363,47 @@ enum WindowEnumerator {
         }
 
         // Permanent rejects only (phantoms/undersized). Minimized ids are tracked
-        // separately so restoring a window can bring it back. Ids an *incomplete*
-        // probe failed to resolve are unknowns, not phantoms — poisoning them
-        // into ignoredWindowIDs made windows vanish for good after one AX
-        // timeout, because snapshot() never re-probes ignored ids.
+        // separately so restoring a window can bring it back. A phantom is an id
+        // the probe *judged* (resolved, but not a standard window) or — after a
+        // finished scan — an on-screen id nothing resolved to. An off-screen id
+        // the scan couldn't resolve is different: it may be a real window in
+        // another Space whose AX element id sits beyond the brute-force range
+        // (Chrome). Poisoning those into ignoredWindowIDs — as `expected -
+        // accepted` used to — hid real windows for good.
         let undersized = Set(probed.windows.compactMap { win -> CGWindowID? in
             let frame = boundsByID[win.wid] ?? win.axFrame
             return (frame.width < minWindowSize.width || frame.height < minWindowSize.height)
                 ? win.wid : nil
         })
-        let rejected: Set<CGWindowID> = (probeOtherSpaces && probed.complete)
-            ? expected.subtracting(accepted).subtracting(minimized).union(undersized)
-            : undersized
+        let rejected: Set<CGWindowID>
+        let unreachable: Set<CGWindowID>
+        if probeOtherSpaces && probed.complete {
+            let judged = expected.intersection(seen).subtracting(accepted).subtracting(minimized)
+            let unresolved = expected.subtracting(seen)
+            rejected = judged.union(unresolved.intersection(onScreenIDs)).union(undersized)
+            unreachable = unresolved.subtracting(onScreenIDs)
+        } else {
+            rejected = undersized
+            unreachable = []
+        }
 
         cacheLock.lock()
         var base = cachedWindows ?? []
-        // Only a complete cross-Space probe may wipe the app's cache wholesale.
-        // A current-Space merge must not drop other-Space windows we already
-        // know, and an incomplete probe must not drop windows it merely missed.
-        if probeOtherSpaces && probed.complete {
-            base.removeAll { $0.info.pid == pid }
-        } else {
-            let replaced = Set(merged.map(\.info.windowID))
-            base.removeAll { $0.info.pid == pid && replaced.contains($0.info.windowID) }
-            // Also drop dead ones for this pid that CG no longer lists.
-            base.removeAll { $0.info.pid == pid && !expected.contains($0.info.windowID) }
-            // Prefer newly probed entries when both exist.
-            base.removeAll { replaced.contains($0.info.windowID) }
+        let replaced = Set(merged.map(\.info.windowID))
+        // Drop this app's entries that died (CG no longer lists them), were
+        // re-judged by this probe, or were rejected. Entries the probe merely
+        // couldn't reach stay: their cached AX element (captured while the
+        // window was in the current Space) remains valid across Spaces, and
+        // wiping them wholesale was what made Chrome windows vanish on every
+        // re-probe.
+        base.removeAll {
+            $0.info.pid == pid
+                && (!expected.contains($0.info.windowID)
+                    || seen.contains($0.info.windowID)
+                    || rejected.contains($0.info.windowID))
         }
+        // Prefer newly probed entries when both exist.
+        base.removeAll { replaced.contains($0.info.windowID) }
         // Minimized windows must not linger in the shown cache.
         base.removeAll { minimized.contains($0.info.windowID) }
         base.append(contentsOf: merged)
@@ -384,6 +412,9 @@ enum WindowEnumerator {
         ignoredWindowIDs.subtract(accepted)
         minimizedWindowIDs.formUnion(minimized)
         minimizedWindowIDs.subtract(accepted)
+        let stillCached = Set(base.map(\.info.windowID))
+        unreachableWindowIDs.formUnion(unreachable.subtracting(stillCached))
+        unreachableWindowIDs.subtract(accepted)
         cacheLock.unlock()
         return true
     }
@@ -433,6 +464,7 @@ enum WindowEnumerator {
         var ranked: [RankedWindow] = []
         var foundMinimized: Set<CGWindowID> = []
         var completePIDs: Set<pid_t> = []
+        var seenByPID: [pid_t: Set<CGWindowID>] = [:]
         DispatchQueue.concurrentPerform(iterations: apps.count) { i in
             let app = apps[i]
             let expected = expectedByPID[app.processIdentifier] ?? []
@@ -460,6 +492,7 @@ enum WindowEnumerator {
             ranked.append(contentsOf: local)
             foundMinimized.formUnion(probed.minimizedIDs)
             if probed.complete { completePIDs.insert(app.processIdentifier) }
+            seenByPID[app.processIdentifier] = probed.seenIDs
             lock.unlock()
         }
         FocusHistory.shared.prune(keeping: Set(boundsByID.keys))
@@ -476,11 +509,49 @@ enum WindowEnumerator {
             else { return nil }
             return e.wid
         })
+
+        // Carry over cached entries this sweep couldn't re-resolve. The public
+        // AX list only covers the current Space and the token probe can't reach
+        // Chrome-like apps' other-Space windows, but an AX element cached while
+        // the window *was* current stays valid across Spaces. Without this,
+        // every Space switch (each one triggers a full sweep) silently dropped
+        // those windows — the "Chrome windows missing most of the time" bug.
+        let liveIDs = Set(boundsByID.keys)
         cacheLock.lock()
-        ignoredWindowIDs = ignoredWindowIDs.intersection(Set(boundsByID.keys)).union(rejected)
+        let previous = cachedWindows ?? []
+        cacheLock.unlock()
+        let carried = previous.filter { entry in
+            guard let seen = seenByPID[entry.info.pid] else { return false }
+            return liveIDs.contains(entry.info.windowID)
+                && !seen.contains(entry.info.windowID)
+                && !accepted.contains(entry.info.windowID)
+                && !foundMinimized.contains(entry.info.windowID)
+                && !rejected.contains(entry.info.windowID)
+        }
+        ranked.append(contentsOf: carried)
+
+        // Off-screen ids a finished probe still couldn't resolve and that we
+        // hold no cached element for: real-but-unreachable until their Space
+        // is visited. Excluding them from the newcomer path prevents a full
+        // re-probe of their app on every single trigger.
+        let listedIDs = Set(ranked.map(\.info.windowID))
+        let unreachable = Set(cgAll.compactMap { e -> CGWindowID? in
+            guard completePIDs.contains(e.pid),
+                  seenByPID[e.pid]?.contains(e.wid) != true,
+                  !listedIDs.contains(e.wid),
+                  !foundMinimized.contains(e.wid),
+                  !onScreenIDs.contains(e.wid)
+            else { return nil }
+            return e.wid
+        })
+
+        cacheLock.lock()
+        ignoredWindowIDs = ignoredWindowIDs.intersection(liveIDs).union(rejected)
         ignoredWindowIDs.subtract(accepted)
-        minimizedWindowIDs = minimizedWindowIDs.intersection(Set(boundsByID.keys)).union(foundMinimized)
+        minimizedWindowIDs = minimizedWindowIDs.intersection(liveIDs).union(foundMinimized)
         minimizedWindowIDs.subtract(accepted)
+        unreachableWindowIDs = unreachableWindowIDs.intersection(liveIDs).union(unreachable)
+        unreachableWindowIDs.subtract(listedIDs)
         cacheLock.unlock()
         return ranked
     }
@@ -508,6 +579,12 @@ enum WindowEnumerator {
     private struct AppProbeResult {
         let windows: [AppWindow]
         let minimizedIDs: Set<CGWindowID>
+        /// Every window id the probe resolved and judged, including rejects.
+        /// Ids in `seenIDs` were affirmatively evaluated; expected ids *not*
+        /// in it were merely unreachable (Chrome's other-Space windows often
+        /// have AX element ids beyond the brute-force range) and must not be
+        /// treated as phantoms or dropped from the cache.
+        let seenIDs: Set<CGWindowID>
         /// False when the AX list read failed or the remote-token scan ran out
         /// of budget: window ids the probe didn't resolve are then unknowns,
         /// not phantoms, and must not be added to `ignoredWindowIDs`.
@@ -598,6 +675,7 @@ enum WindowEnumerator {
         return AppProbeResult(
             windows: windows,
             minimizedIDs: minimizedIDs,
+            seenIDs: seen,
             complete: covered() || (listOK && !timedOut)
         )
     }
