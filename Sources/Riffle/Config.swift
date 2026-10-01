@@ -187,6 +187,20 @@ final class Config {
         return bindings.contains { $0.keyCode == candidate.keyCode && $0.flags == candidate.flags }
     }
 
+    // MARK: - Settings shortcut
+
+    /// ⌥⌘R opens the Settings window from anywhere. Fixed rather than
+    /// user-editable so a bad shortcut edit can never lock the user out of
+    /// Settings; recording refuses this combination for the same reason.
+    static let settingsShortcutKeyCode: Int64 = 15 // r
+    static let settingsShortcutFlags: CGEventFlags = [.maskCommand, .maskAlternate]
+    static let settingsShortcutDisplay = "⌥⌘R"
+
+    static func isSettingsShortcut(keyCode: Int64, flags: CGEventFlags) -> Bool {
+        let relevant: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
+        return keyCode == settingsShortcutKeyCode && flags.intersection(relevant) == settingsShortcutFlags
+    }
+
     private static func clampScale(_ v: Double) -> Double {
         min(max(v, listScaleRange.lowerBound), listScaleRange.upperBound)
     }

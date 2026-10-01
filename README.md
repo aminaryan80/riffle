@@ -71,12 +71,13 @@ When an update is available, Riffle downloads the release's app zip, shows a pro
 | Move around the list | **↓/→** forward, **↑/←** backward (while the list is open) |
 | Switch to the selected window | Release ⌘ |
 | Cancel without switching | **Esc** |
+| Open Settings | **⌥⌘R** (works anywhere) |
 
 The list is in most-recently-used order — Riffle tracks window focus while it runs (macOS has no built-in "last focused" timestamp), so the order is true MRU across all Spaces and monitors. Windows not focused since the app launched fall back to front-to-back stacking order. The selection starts on the *second* item, so a quick ⌘Tab tap-and-release jumps to your previous window. Minimized windows and phantom helper windows that some apps create (Chrome, Acrobat, …) are hidden — only real, open windows are listed.
 
 ## Configuration
 
-Open the menu bar icon → **Settings…**. From there you can:
+Open the menu bar icon → **Settings…** (or press **⌥⌘R** from anywhere). From there you can:
 
 - **Shortcuts** — click a shortcut to re-record it (just press the new key combination; Esc cancels), pick what each one shows from the dropdown (*active monitor / all monitors / current app / the window I'm looking at*), remove shortcuts, or add new ones. Changes apply immediately.
 - **Appearance** — scale the whole switcher with the *List size* slider (it still grows automatically for shorter lists) and drag *Background* from glassy (translucent blur) to fully solid.

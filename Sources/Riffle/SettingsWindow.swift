@@ -64,7 +64,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         content.addArrangedSubview(header("Shortcuts"))
         content.addArrangedSubview(caption(
             "Click a shortcut to change it, then press the new key combination. "
-            + "Shortcuts need ⌘, ⌥ or ⌃. Holding ⇧ cycles backwards. Esc cancels recording."))
+            + "Shortcuts need ⌘, ⌥ or ⌃. Holding ⇧ cycles backwards. Esc cancels recording. "
+            + "\(Config.settingsShortcutDisplay) always opens this window."))
         bindingsStack.orientation = .vertical
         bindingsStack.alignment = .leading
         bindingsStack.spacing = 6
@@ -196,6 +197,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         guard let index = recordingIndex else { return }
         if keyCode == 53 { // escape cancels
             reload()
+            return
+        }
+        if Config.isSettingsShortcut(keyCode: keyCode, flags: flags) { // reserved
+            NSSound.beep()
             return
         }
         guard let name = Config.keyNames[keyCode] else {

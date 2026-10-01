@@ -177,6 +177,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async { self.switcher.step(backwards: backwards) }
                 return nil // consume
             }
+            if Config.isSettingsShortcut(keyCode: keyCode, flags: flags) {
+                // Checked before user bindings so it stays reserved. Drop any
+                // open session first, or releasing the modifiers would commit
+                // a switch and steal focus from the window we just opened.
+                DispatchQueue.main.async {
+                    self.switcher.cancel()
+                    self.openSettings()
+                }
+                return nil // consume
+            }
             if let binding = Config.shared.binding(keyCode: keyCode, flags: flags) {
                 let backwards = flags.contains(.maskShift)
                 // Do the real work outside the tap callback so the tap never
@@ -224,7 +234,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         secureInputItem = warning
         menu.addItem(warning)
 
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        // Mirrors the global shortcut handled by the event tap; menu key
+        // equivalents only fire while the menu is open, so this is a hint.
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: "r")
+        settingsItem.keyEquivalentModifierMask = [.command, .option]
         settingsItem.target = self
         menu.addItem(settingsItem)
 
