@@ -153,6 +153,26 @@ enum WindowEnumerator {
             .wid
     }
 
+    /// Windows visible right now, front to back, with frames read live from
+    /// the window server. Built for gaze hit-testing, which runs many times a
+    /// second: it costs one CGWindowList call and never probes AX. Cached
+    /// frames are not reused because they go stale the moment a window moves;
+    /// windows the cache hasn't met yet are skipped until the next refresh.
+    static func visibleWindows() -> [WindowInfo] {
+        cacheLock.lock()
+        let cached = cachedWindows ?? []
+        cacheLock.unlock()
+        let byID = Dictionary(cached.map { ($0.info.windowID, $0.info) }, uniquingKeysWith: { a, _ in a })
+        return cgWindows([.optionOnScreenOnly, .excludeDesktopElements]).compactMap { entry in
+            guard let info = byID[entry.wid] else { return nil }
+            return WindowInfo(
+                ax: info.ax, windowID: info.windowID, pid: info.pid,
+                appName: info.appName, icon: info.icon, title: info.title,
+                frame: entry.bounds
+            )
+        }
+    }
+
     /// Cheap per-trigger view over the (cached) window list. Serves the last
     /// enumeration immediately; only the very first call pays for a synchronous
     /// sweep. Removals sync against the window server (cheap). New windows are
@@ -565,6 +585,15 @@ enum WindowEnumerator {
         AXUIElementSetAttributeValue(window.ax, kAXMainAttribute as CFString, kCFBooleanTrue)
         // Raising a window in another Space makes macOS switch to that Space.
         AXUIElementPerformAction(window.ax, kAXRaiseAction as CFString)
+    }
+
+    /// `focus` plus the bookkeeping every switch Riffle makes needs: the MRU
+    /// stamp, and a refresh of just the target app so the next trigger sees
+    /// the new z-order/title without a full sweep.
+    static func switchTo(_ window: WindowInfo) {
+        focus(window)
+        FocusHistory.shared.record(window.windowID)
+        refreshAppAsync(pid: window.pid)
     }
 
     // MARK: - Per-app window discovery

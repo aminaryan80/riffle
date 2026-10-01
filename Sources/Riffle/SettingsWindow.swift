@@ -1,7 +1,9 @@
 import AppKit
+import AVFoundation
 
 /// The Settings window: edit/add/remove shortcuts (with live key recording),
-/// choose what each shortcut shows, and manage the excluded-apps list.
+/// choose what each shortcut shows, tune gaze focus, and manage the
+/// excluded-apps list.
 final class SettingsWindowController: NSObject, NSWindowDelegate {
     private weak var appDelegate: AppDelegate?
     private var window: NSWindow?
@@ -9,6 +11,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let bindingsStack = NSStackView()
     private let excludedStack = NSStackView()
     private let addAppButton = NSPopUpButton(frame: .zero, pullsDown: true)
+
+    private let gazeEnabledBox = NSButton(checkboxWithTitle: "Enable gaze tracking", target: nil, action: nil)
+    private let gazeStatusLabel = NSTextField(wrappingLabelWithString: "")
+    private let cameraPopup = NSPopUpButton()
+    private let calibrateButton = NSButton(title: "Calibrate…", target: nil, action: nil)
+    private let cameraPrivacyButton = NSButton(title: "Open Camera Privacy Settings…", target: nil, action: nil)
+    private let dwellBox = NSButton(checkboxWithTitle: "Switch focus automatically when I look at a window",
+                                    target: nil, action: nil)
+    private let dwellSlider = NSSlider()
+    private let dwellValueLabel = NSTextField(labelWithString: "")
+    private var gazeStatusTimer: Timer?
 
     private var comboButtons: [NSButton] = []
     private var recordingIndex: Int?
@@ -25,10 +38,18 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         reload()
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+        // Tracking state changes on its own (face in/out of view, camera
+        // coming up); a slow poll keeps the status line honest while open.
+        gazeStatusTimer?.invalidate()
+        gazeStatusTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.updateGazeStatus()
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
         cancelRecording()
+        gazeStatusTimer?.invalidate()
+        gazeStatusTimer = nil
     }
 
     // MARK: - Layout
@@ -71,6 +92,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             action: #selector(backgroundOpacityChanged(_:))))
 
         content.addArrangedSubview(spacer(12))
+        content.addArrangedSubview(header("Gaze Focus"))
+        content.addArrangedSubview(caption(
+            "Uses your camera to tell which window you're looking at. Video is processed on this Mac "
+            + "and never stored or sent anywhere. Expect it to tell windows apart, not to point precisely."))
+        buildGazeControls(into: content)
+
+        content.addArrangedSubview(spacer(12))
         content.addArrangedSubview(header("Excluded Apps"))
         content.addArrangedSubview(caption("Windows of these apps never appear in any list."))
         excludedStack.orientation = .vertical
@@ -109,6 +137,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private func reload() {
         cancelRecording()
         rebuildBindingRows()
+        reloadGazeControls()
         rebuildExcludedRows()
         resizeToFit()
     }
@@ -316,6 +345,190 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     @objc private func backgroundOpacityChanged(_ sender: NSSlider) {
         Config.shared.setBackgroundOpacity(sender.doubleValue)
+    }
+
+    // MARK: - Gaze focus
+
+    private func buildGazeControls(into content: NSStackView) {
+        gazeEnabledBox.target = self
+        gazeEnabledBox.action = #selector(gazeEnabledToggled)
+        content.addArrangedSubview(gazeEnabledBox)
+
+        gazeStatusLabel.font = .systemFont(ofSize: 11)
+        gazeStatusLabel.textColor = .secondaryLabelColor
+        gazeStatusLabel.preferredMaxLayoutWidth = Self.rowWidth
+        content.addArrangedSubview(gazeStatusLabel)
+
+        let cameraLabel = NSTextField(labelWithString: "Camera")
+        cameraLabel.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        cameraPopup.target = self
+        cameraPopup.action = #selector(cameraPicked)
+        let cameraRow = NSStackView(views: [cameraLabel, cameraPopup, NSView()])
+        cameraRow.orientation = .horizontal
+        cameraRow.spacing = 8
+        cameraRow.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+        content.addArrangedSubview(cameraRow)
+
+        calibrateButton.bezelStyle = .rounded
+        calibrateButton.target = self
+        calibrateButton.action = #selector(calibrateTapped)
+        cameraPrivacyButton.bezelStyle = .rounded
+        cameraPrivacyButton.target = self
+        cameraPrivacyButton.action = #selector(openCameraPrivacy)
+        let buttonRow = NSStackView(views: [calibrateButton, cameraPrivacyButton, NSView()])
+        buttonRow.orientation = .horizontal
+        buttonRow.spacing = 8
+        buttonRow.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+        content.addArrangedSubview(buttonRow)
+
+        dwellBox.target = self
+        dwellBox.action = #selector(dwellToggled)
+        content.addArrangedSubview(dwellBox)
+
+        let dwellLabel = NSTextField(labelWithString: "Look for")
+        dwellLabel.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        dwellSlider.minValue = GazeSettings.dwellRange.lowerBound
+        dwellSlider.maxValue = GazeSettings.dwellRange.upperBound
+        dwellSlider.isContinuous = true
+        dwellSlider.target = self
+        dwellSlider.action = #selector(dwellSecondsChanged(_:))
+        dwellSlider.widthAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
+        dwellValueLabel.font = .systemFont(ofSize: 11)
+        dwellValueLabel.textColor = .secondaryLabelColor
+        dwellValueLabel.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        let dwellRow = NSStackView(views: [dwellLabel, endcapLabel("Quick"), dwellSlider, endcapLabel("Patient"), dwellValueLabel])
+        dwellRow.orientation = .horizontal
+        dwellRow.spacing = 8
+        dwellRow.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+        content.addArrangedSubview(dwellRow)
+
+        content.addArrangedSubview(caption(
+            "Automatic switching waits until you've stopped typing and mousing. For on-demand switching, "
+            + "set a shortcut above to “\(Scope.gaze.label)”: hold it, look at a window, release."))
+    }
+
+    private func reloadGazeControls() {
+        let settings = Config.shared.gaze
+        dwellSlider.doubleValue = settings.dwellSeconds
+        dwellValueLabel.stringValue = String(format: "%.1f s", settings.dwellSeconds)
+        rebuildCameraMenu()
+        updateGazeStatus()
+    }
+
+    /// Checkbox and enabled states only — never slider values, which the
+    /// user may be dragging when the status timer fires.
+    private func syncGazeControlStates() {
+        let settings = Config.shared.gaze
+        gazeEnabledBox.state = settings.enabled ? .on : .off
+        dwellBox.state = settings.dwellEnabled ? .on : .off
+        dwellBox.isEnabled = settings.enabled
+        dwellSlider.isEnabled = settings.enabled && settings.dwellEnabled
+        cameraPopup.isEnabled = settings.enabled
+        let status = CameraCapture.authorizationStatus
+        calibrateButton.isEnabled = status != .denied && status != .restricted
+    }
+
+    private func rebuildCameraMenu() {
+        cameraPopup.removeAllItems()
+        cameraPopup.addItem(withTitle: "System default")
+        cameraPopup.lastItem?.representedObject = nil
+        let selectedID = Config.shared.gaze.cameraID
+        var selectedIndex = 0
+        for device in CameraCapture.availableCameras() {
+            cameraPopup.addItem(withTitle: device.localizedName)
+            cameraPopup.lastItem?.representedObject = device.uniqueID
+            if device.uniqueID == selectedID { selectedIndex = cameraPopup.numberOfItems - 1 }
+        }
+        cameraPopup.selectItem(at: selectedIndex)
+    }
+
+    private func updateGazeStatus() {
+        syncGazeControlStates()
+        let camera: String
+        switch CameraCapture.authorizationStatus {
+        case .authorized: camera = "allowed"
+        case .notDetermined: camera = "not asked yet"
+        case .denied: camera = "denied"
+        case .restricted: camera = "restricted"
+        @unknown default: camera = "unknown"
+        }
+        let denied = CameraCapture.authorizationStatus == .denied || CameraCapture.authorizationStatus == .restricted
+        cameraPrivacyButton.isHidden = !denied
+
+        let calibration: String
+        if let model = GazeCalibrationStore.shared.model() {
+            calibration = "ready (avg. error \(Int(model.meanErrorPoints.rounded())) pt)"
+        } else {
+            calibration = "needed for this monitor layout"
+        }
+
+        let tracking: String
+        switch GazeFocusController.shared.visionSource.state {
+        case .off: tracking = "off"
+        case .starting: tracking = "starting camera…"
+        case .noCamera: tracking = "no camera"
+        case .noFace: tracking = "no face in view"
+        case .tracking: tracking = "face detected"
+        }
+        gazeStatusLabel.stringValue = "Camera: \(camera)  ·  Calibration: \(calibration)  ·  Tracking: \(tracking)"
+    }
+
+    @objc private func gazeEnabledToggled() {
+        var settings = Config.shared.gaze
+        guard gazeEnabledBox.state == .on else {
+            settings.enabled = false
+            Config.shared.setGaze(settings)
+            reloadGazeControls()
+            return
+        }
+        GazeFocusController.shared.ensureCameraAccess { [weak self] granted in
+            guard let self else { return }
+            var settings = Config.shared.gaze
+            settings.enabled = granted
+            Config.shared.setGaze(settings)
+            // Without a shortcut or dwell, enabling does nothing visible. Hand
+            // the user a shortcut (it shows up in the list above) unless that
+            // combination is already taken.
+            let def = GazeSettings.defaultGazeBinding
+            if granted, !Config.shared.hasGazeBinding, !settings.dwellEnabled,
+               !Config.shared.hasBinding(key: def.key, modifiers: def.modifiers) {
+                Config.shared.addBinding(def)
+                rebuildBindingRows()
+                resizeToFit()
+            }
+            reloadGazeControls()
+            if !granted { NSSound.beep() }
+        }
+    }
+
+    @objc private func cameraPicked() {
+        var settings = Config.shared.gaze
+        settings.cameraID = cameraPopup.selectedItem?.representedObject as? String
+        Config.shared.setGaze(settings)
+    }
+
+    @objc private func calibrateTapped() {
+        GazeFocusController.shared.calibrate()
+    }
+
+    @objc private func openCameraPrivacy() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func dwellToggled() {
+        var settings = Config.shared.gaze
+        settings.dwellEnabled = dwellBox.state == .on
+        Config.shared.setGaze(settings)
+        reloadGazeControls()
+    }
+
+    @objc private func dwellSecondsChanged(_ sender: NSSlider) {
+        var settings = Config.shared.gaze
+        settings.dwellSeconds = sender.doubleValue
+        Config.shared.setGaze(settings)
+        dwellValueLabel.stringValue = String(format: "%.1f s", Config.shared.gaze.dwellSeconds)
     }
 
     private static func appInfo(for identifier: String) -> (String, NSImage?) {

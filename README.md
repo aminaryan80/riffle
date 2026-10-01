@@ -11,6 +11,7 @@ A tiny, custom [AltTab](https://alt-tab-macos.netlify.app/)-style **window** swi
   - **⌥ Tab** — cycle through the windows of the **frontmost app** (e.g. jump between open Chrome windows while in Chrome).
 - Hold the modifier and keep pressing the key to move down the list; add **Shift** to move backwards; release the modifier to switch to the selected window; press **Esc** to cancel.
 - A **Settings window** (menu bar icon → Settings…) to add/remove/re-record shortcuts, choose what each one shows, tune the switcher's appearance (list size and background opacity), and exclude apps from all lists — no config-file editing needed.
+- **Gaze Focus (experimental, off by default)** — uses the webcam to tell which window you're looking at: hold a shortcut, look, release to focus; or let focus follow your gaze after a short dwell. Everything runs on-device with Apple's Vision framework — no extra hardware, no network. See [Gaze Focus](#gaze-focus-experimental).
 - Runs as a menu-bar-only app (no Dock icon).
 
 ## Requirements
@@ -77,11 +78,42 @@ The list is in most-recently-used order — Riffle tracks window focus while it 
 
 Open the menu bar icon → **Settings…**. From there you can:
 
-- **Shortcuts** — click a shortcut to re-record it (just press the new key combination; Esc cancels), pick what each one shows from the dropdown (*active monitor / all monitors / current app*), remove shortcuts, or add new ones. Changes apply immediately.
+- **Shortcuts** — click a shortcut to re-record it (just press the new key combination; Esc cancels), pick what each one shows from the dropdown (*active monitor / all monitors / current app / the window I'm looking at*), remove shortcuts, or add new ones. Changes apply immediately.
 - **Appearance** — scale the whole switcher with the *List size* slider (it still grows automatically for shorter lists) and drag *Background* from glassy (translucent blur) to fully solid.
+- **Gaze Focus** — enable the camera, pick which one, calibrate, and choose between shortcut-driven and automatic (dwell) switching. See below.
 - **Excluded Apps** — add any running app (or pick one from disk) to hide all of its windows from every list; remove it to bring it back.
 
 A shortcut needs at least one of ⌘, ⌥, ⌃. Record without ⇧ — then Shift automatically means "cycle backwards" for that shortcut.
+
+## Gaze Focus (experimental)
+
+Riffle can use your Mac's camera to work out which window you're looking at and focus it. It is built to tell *windows* apart, not to point precisely: with a normal webcam expect it to be reliable for picking a monitor or one of a few large windows, and unreliable for small windows in a crowded layout.
+
+### Setup
+
+1. Menu bar icon → **Settings…** → **Gaze Focus** → tick **Enable gaze tracking**. macOS asks for Camera access once; the camera's indicator light stays on while tracking is enabled.
+2. Click **Calibrate…** (also in the menu bar menu). A dot visits a grid of points on each monitor — follow it with your eyes, keep your head still, sit the way you normally do. Afterwards a ring shows live where Riffle thinks you're looking so you can judge the result; press any key to finish. Esc cancels at any point.
+3. Pick how you want to switch:
+   - **Shortcut (recommended)** — enabling gaze adds a `⌘⌥ Tab` shortcut set to *The window I'm looking at* (if that combination was free). Hold it, a frame follows your gaze from window to window, release to focus the framed window. Any shortcut can be set to this scope.
+   - **Automatic (dwell)** — tick *Switch focus automatically when I look at a window* and set how long a look counts. Riffle waits until you've stopped typing (1 s) and mousing before switching, never switches while a switcher list is open, and flashes a frame around the window it just focused so it's clear why focus moved.
+
+Calibration is per monitor layout (docked vs. laptop-only each keep their own) and goes stale if you move the camera, the monitor, or your chair much — just recalibrate. The Settings window shows camera, calibration and tracking status.
+
+### Tips
+
+- Camera placement matters more than anything: it should sit on the monitor you look at most, roughly at eye level. A 1080p external webcam, or an iPhone via Continuity Camera, gives much better eye detail than a built-in camera — but turn **Center Stage off** (Control Center → Video Effects) since its auto-framing moves the picture under the tracker.
+- Even, front-facing light. Strong backlight (a window behind you) is the most common cause of a failed calibration.
+- Glasses are usually fine; heavy reflections or dark lenses aren't.
+
+### Privacy
+
+Frames go from the camera straight into Apple's on-device Vision framework and are discarded. Nothing is recorded, saved, or sent anywhere; the only thing written to disk is a few dozen calibration numbers in `~/Library/Application Support/Riffle/gaze-calibration.json`. Screen Recording permission is still not needed.
+
+### Limitations
+
+- Head movement the calibration didn't see (leaning in, sliding your chair) shifts the estimate until you recalibrate.
+- Monitors far off the camera's axis are less accurate than the one it sits on.
+- This is a deliberately dependency-free implementation; commercial webcam trackers with dedicated models (e.g. Beam) are considerably more accurate. The gaze backend is behind a small protocol so one of those could be added later.
 
 ### Config file (advanced)
 
@@ -112,11 +144,14 @@ Default config:
   - `activeScreen` — only windows on the physical monitor containing the currently focused window.
   - `allScreens` — every window on every monitor.
   - `activeApp` — only windows belonging to the frontmost app (on any monitor).
+  - `gaze` — no list: hold, look at a window, release to focus it (needs Gaze Focus enabled and calibrated).
 
 Two more optional keys tune the switcher's look (or use the Settings window):
 
 - **`listScale`** — multiplier over the dynamic row sizing (clamped to a sensible range).
 - **`backgroundOpacity`** — `0` for a fully glassy blur, `1` for a solid background.
+
+Gaze Focus settings live under an optional `gaze` object: `enabled`, `dwellEnabled`, `dwellSeconds` (0.3–2.0), `cameraID` (an `AVCaptureDevice` unique ID; omit for the system default).
 
 Add as many bindings as you like. Example — `option+tab` for all screens instead of `` cmd+` ``:
 
@@ -132,7 +167,7 @@ rm -rf /Applications/Riffle.app
 rm -rf ~/Library/Application\ Support/Riffle
 ```
 
-Then remove Riffle from **System Settings → Privacy & Security → Accessibility**.
+Then remove Riffle from **System Settings → Privacy & Security → Accessibility** (and **Camera**, if you enabled Gaze Focus).
 
 ## Troubleshooting
 
@@ -144,6 +179,9 @@ Then remove Riffle from **System Settings → Privacy & Security → Accessibili
 - **After rebuilding/reinstalling, hotkeys stopped working** — the ad-hoc code signature changes with each build, so macOS may treat it as a different app while the old grant lingers (the toggle looks on but doesn't apply). `install.sh` now clears the stale entry automatically (`tccutil reset Accessibility com.amin.riffle`) and the app re-prompts, so just re-enable **Riffle** in the Accessibility list after reinstalling. If you copied the app by hand instead of using `install.sh`, run that `tccutil` command yourself, then relaunch.
 - **A hotkey does nothing** — check the key/modifier names in `config.json` against the lists above, then relaunch. Malformed config falls back to the defaults. Key codes assume an ANSI (US-style) physical layout.
 - **An app's windows never appear in the list** — windows in other Spaces are found via the same accessibility side channel AltTab uses; a few apps with non-native toolkits (LibreOffice, some Java apps) don't answer those queries for windows outside the current Space and can't be listed. Switch to their Space once and they'll appear.
+- **The gaze shortcut just beeps** — Gaze Focus is off, not calibrated for the current monitor layout, or the camera isn't available. Open Settings → Gaze Focus and read the status line; **Calibrate…** fixes the common case.
+- **Gaze picks the wrong window / drifts** — recalibrate (menu bar → Calibrate Gaze…), especially after moving the camera, monitor or chair. If it's consistently off in one direction, your posture during calibration differed from how you actually sit; calibrate while sitting normally. Make sure Center Stage is off.
+- **Calibration says it couldn't see your eyes** — face the camera squarely, add front light, remove strong backlight. If you wear glasses, tilt them slightly to kill reflections.
 - **Is it running?** — look for the small window icon in the menu bar.
 
 ## Project layout
@@ -154,13 +192,23 @@ Sources/Riffle/
   main.swift                        entry point
   AppDelegate.swift                 event tap (hotkey interception), menu bar item, permissions
   Config.swift                      settings storage, editing API, key/modifier resolution
-  SettingsWindow.swift              the Settings UI (shortcut recorder, scopes, appearance, excluded apps)
+  SettingsWindow.swift              the Settings UI (shortcut recorder, scopes, appearance, gaze, excluded apps)
   WindowEnumerator.swift            window listing across Spaces + focusing, monitor detection, caching
   PrivateAX.swift                   private accessibility APIs for windows in other Spaces
   SwitcherController.swift          trigger → cycle → commit/cancel state machine
   SwitcherPanel.swift               the floating icon+title list UI
   Updater.swift                     in-app updater (GitHub Releases): check, download, swap, relaunch
-Resources/Info.plist                app bundle metadata (menu-bar-only app)
+  Gaze/
+    GazeTypes.swift                 GazeSource protocol, sample/feature types, screen-coordinate helpers
+    CameraCapture.swift             AVCaptureSession wrapper (camera list, permission, frames)
+    FaceTracker.swift               Vision face pose + eye/pupil landmarks → GazeFeatures
+    GazeCalibration.swift           ridge-regression features → screen model, per-layout store
+    OneEuroFilter.swift             gaze smoothing
+    VisionGazeSource.swift          the webcam backend: camera → features → calibrated, filtered points
+    GazeFocusController.swift       hold-look-release sessions, dwell, window hit-testing
+    GazeCalibrationFlow.swift       full-screen calibration dots + live preview
+    GazeHighlightPanel.swift        the frame drawn around the gazed-at window
+Resources/Info.plist                app bundle metadata (menu-bar-only app, camera usage text)
 Resources/Riffle.icns               app icon
 Tools/GenerateIcon.swift            regenerates the app icon (see below)
 build.sh                            compile + assemble + sign dist/Riffle.app

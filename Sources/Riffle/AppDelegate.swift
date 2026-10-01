@@ -111,6 +111,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         WindowCacheObserver.shared.start()
         registerWorkspaceObservers()
         WindowEnumerator.refreshAsync()
+        // Gaze needs Accessibility too (to focus windows), so it starts here
+        // rather than at launch; the camera only runs if the user enabled it.
+        GazeFocusController.shared.isSwitcherActive = { [weak self] in self?.switcher.isActive ?? false }
+        GazeFocusController.shared.start()
         NSLog("Riffle: event tap active")
     }
 
@@ -156,6 +160,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if type == .keyDown {
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
             let flags = event.flags
+            // Dwell-to-focus holds off while the user is typing.
+            GazeFocusController.shared.noteKeyboardActivity()
 
             if let handler = recordingHandler {
                 DispatchQueue.main.async { handler(keyCode, flags) }
@@ -222,6 +228,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsItem.target = self
         menu.addItem(settingsItem)
 
+        // Calibration is redone whenever the monitor or chair moves, so it
+        // gets a top-level entry rather than living only inside Settings.
+        let calibrateItem = NSMenuItem(title: "Calibrate Gaze…", action: #selector(calibrateGaze), keyEquivalent: "")
+        calibrateItem.target = self
+        menu.addItem(calibrateItem)
+
         let updatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
         updatesItem.target = self
         menu.addItem(updatesItem)
@@ -235,6 +247,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettings() {
         settings.show()
+    }
+
+    @objc private func calibrateGaze() {
+        GazeFocusController.shared.calibrate()
     }
 
     @objc private func checkForUpdates() {

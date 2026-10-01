@@ -24,9 +24,27 @@ final class SwitcherController {
 
     /// A bound hotkey was pressed (possibly repeatedly while held).
     func handleTrigger(binding: ResolvedBinding, backwards: Bool) {
+        if binding.scope == .gaze {
+            // Same hold/release session as a list, but the "selection" is
+            // whatever the user is looking at; extra taps change nothing.
+            if isActive && currentScope == .gaze { return }
+            if isActive { reset() }
+            guard GazeFocusController.shared.beginHotkeySession() else {
+                NSSound.beep()
+                return
+            }
+            currentScope = .gaze
+            holdModifiers = binding.flags.subtracting(.maskShift)
+            isActive = true
+            return
+        }
+
         if isActive && currentScope == binding.scope {
             step(backwards: backwards)
             return
+        }
+        if currentScope == .gaze {
+            GazeFocusController.shared.cancelHotkeySession()
         }
 
         // Fresh session, or scope change mid-session (e.g. cmd+tab then cmd+`).
@@ -39,6 +57,8 @@ final class SwitcherController {
             filtered = snap.windows
         case .activeApp:
             filtered = snap.windows.filter { $0.pid == snap.frontmostPID }
+        case .gaze:
+            return // handled above
         }
         guard !filtered.isEmpty else {
             if isActive { cancel() }
@@ -66,17 +86,21 @@ final class SwitcherController {
 
     func commit() {
         guard isActive else { return }
+        if currentScope == .gaze {
+            reset()
+            GazeFocusController.shared.commitHotkeySession()
+            return
+        }
         let target = windows[selectedIndex]
         reset()
-        WindowEnumerator.focus(target)
-        FocusHistory.shared.record(target.windowID)
-        // Focus just changed; a full sweep is overkill — refresh the target app
-        // so the next trigger sees updated z-order/title without scanning everyone.
-        WindowEnumerator.refreshAppAsync(pid: target.pid)
+        WindowEnumerator.switchTo(target)
     }
 
     func cancel() {
         guard isActive else { return }
+        if currentScope == .gaze {
+            GazeFocusController.shared.cancelHotkeySession()
+        }
         reset()
     }
 

@@ -4,12 +4,17 @@ enum Scope: String, Codable, CaseIterable {
     case activeScreen
     case allScreens
     case activeApp
+    /// Not a list at all: hold the shortcut, look at a window, release to
+    /// focus it. Lives in `Scope` so the existing shortcut UI, recording and
+    /// hold/release session logic apply unchanged.
+    case gaze
 
     var label: String {
         switch self {
         case .activeScreen: return "Windows on the active monitor"
         case .allScreens: return "Windows on all monitors"
         case .activeApp: return "Windows of the current app"
+        case .gaze: return "The window I'm looking at"
         }
     }
 }
@@ -20,12 +25,38 @@ struct KeyBinding: Codable {
     var scope: Scope
 }
 
+struct GazeSettings: Codable, Equatable {
+    /// Master switch: the camera runs only while this is on.
+    var enabled = false
+    /// Focus a window automatically after looking at it for `dwellSeconds`.
+    var dwellEnabled = false
+    var dwellSeconds = 0.8
+    /// `AVCaptureDevice.uniqueID`; nil picks the system default camera.
+    var cameraID: String?
+
+    static let dwellRange: ClosedRange<Double> = 0.3...2.0
+    static let defaultGazeBinding = KeyBinding(key: "tab", modifiers: ["cmd", "option"], scope: .gaze)
+
+    init() {}
+
+    // Every key optional so a config written by an older build (or edited by
+    // hand) keeps decoding instead of resetting the whole file to defaults.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        dwellEnabled = try c.decodeIfPresent(Bool.self, forKey: .dwellEnabled) ?? false
+        dwellSeconds = try c.decodeIfPresent(Double.self, forKey: .dwellSeconds) ?? 0.8
+        cameraID = try c.decodeIfPresent(String.self, forKey: .cameraID)
+    }
+}
+
 struct ConfigFile: Codable {
     var bindings: [KeyBinding]
     var excludedApps: [String]?
     // Appearance. Optional so older config files decode with defaults.
     var listScale: Double?
     var backgroundOpacity: Double?
+    var gaze: GazeSettings?
 }
 
 struct ResolvedBinding {
@@ -58,6 +89,11 @@ final class Config {
     private(set) var listScale: Double = 1.0
     /// Panel background solidity: 0 = fully glassy (blur), 1 = solid/opaque.
     private(set) var backgroundOpacity: Double = 0.0
+    private(set) var gaze = GazeSettings()
+
+    /// Fires on the main thread after `gaze` changes, so the tracker can
+    /// start/stop the camera without polling.
+    var onGazeSettingsChanged: ((GazeSettings) -> Void)?
 
     static let listScaleRange: ClosedRange<Double> = 0.96...1.44
     static let backgroundOpacityRange: ClosedRange<Double> = 0.0...1.0
@@ -82,6 +118,8 @@ final class Config {
             setExcludedApps(file.excludedApps ?? [])
             listScale = Config.clampScale(file.listScale ?? listScale)
             backgroundOpacity = Config.clampOpacity(file.backgroundOpacity ?? backgroundOpacity)
+            gaze = file.gaze ?? GazeSettings()
+            gaze.dwellSeconds = Config.clampDwell(gaze.dwellSeconds)
         } else {
             fileBindings = Config.defaultBindings
             setExcludedApps([])
@@ -107,7 +145,8 @@ final class Config {
             bindings: fileBindings,
             excludedApps: excludedApps,
             listScale: listScale,
-            backgroundOpacity: backgroundOpacity
+            backgroundOpacity: backgroundOpacity,
+            gaze: gaze
         )
         if let data = try? encoder.encode(file) {
             try? data.write(to: Config.fileURL, options: .atomic)
@@ -127,12 +166,37 @@ final class Config {
         save()
     }
 
+    // MARK: - Gaze
+
+    func setGaze(_ value: GazeSettings) {
+        var next = value
+        next.dwellSeconds = Config.clampDwell(next.dwellSeconds)
+        guard next != gaze else { return }
+        gaze = next
+        save()
+        onGazeSettingsChanged?(gaze)
+    }
+
+    var hasGazeBinding: Bool {
+        fileBindings.contains { $0.scope == .gaze }
+    }
+
+    /// True when some shortcut already uses this key + modifier combination.
+    func hasBinding(key: String, modifiers: [String]) -> Bool {
+        guard let candidate = Config.resolve(KeyBinding(key: key, modifiers: modifiers, scope: .gaze)) else { return false }
+        return bindings.contains { $0.keyCode == candidate.keyCode && $0.flags == candidate.flags }
+    }
+
     private static func clampScale(_ v: Double) -> Double {
         min(max(v, listScaleRange.lowerBound), listScaleRange.upperBound)
     }
 
     private static func clampOpacity(_ v: Double) -> Double {
         min(max(v, backgroundOpacityRange.lowerBound), backgroundOpacityRange.upperBound)
+    }
+
+    private static func clampDwell(_ v: Double) -> Double {
+        min(max(v, GazeSettings.dwellRange.lowerBound), GazeSettings.dwellRange.upperBound)
     }
 
     // MARK: - Editing (used by the Settings window)
